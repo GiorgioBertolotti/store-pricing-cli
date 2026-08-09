@@ -44,7 +44,10 @@ def select(message: str, choices: list[str], default: "str | None" = None) -> st
 
 
 def checkbox(message: str, choices: list[str], allow_empty: bool = False) -> list[str]:
-    validate = None if allow_empty else (
+    # questionary's own default is a permissive `lambda a: True`, not None - passing
+    # validate=None outright raises "validate must be callable" rather than being treated
+    # as "no validation", so the allow_empty=True case needs its own permissive callable.
+    validate = (lambda selected: True) if allow_empty else (
         lambda selected: True if selected else "Select at least one (space to toggle, enter to confirm)"
     )
     return _answered(questionary.checkbox(message, choices=choices, style=PROMPT_STYLE, validate=validate).ask())
@@ -185,13 +188,16 @@ _FAILURE_CATEGORIES = [
     # when the real answer is "try again".
     ("Apple API error", "Apple API error - rate limit or timeout (transient, re-run)"),
     ("Currency mismatch", "Currency mismatch (no exchange rate to auto-convert)"),
-    ("Region not found", "Region not configured on this base plan"),
+    ("Region not found", "Region not configured on this base plan / purchase option"),
     ("Base plan", "Base plan not found in subscription"),
+    ("not found in one-time product", "Purchase option not found in one-time product"),
     ("No price points available", "No matching Apple price point"),
     ("Price difference too large", "Closest Apple price point too far off"),
     ("clamped to Google Play minimum", "Price clamped to Google's minimum"),
-    ("Removed from", "Removed from base plan (repeated clamp failure)"),
+    ("Removed from", "Removed from base plan / purchase option (repeated clamp failure)"),
     ("Could not fetch subscription", "Couldn't reach the store (subscription fetch failed)"),
+    ("Could not fetch one-time product", "Couldn't reach the store (one-time product fetch failed)"),
+    ("Could not find in-app purchase", "Couldn't reach the store (in-app purchase not found)"),
     ("can't be changed in place via currency_options", "Locked to Stripe's base Price currency"),
     ("Rejected by Stripe", "Currency rejected by Stripe"),
     ("Missing country/currency code mapping", "Missing country/currency code mapping"),

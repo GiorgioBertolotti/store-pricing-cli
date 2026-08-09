@@ -103,6 +103,19 @@ class GoogleCreds:
 
 
 @dataclass(frozen=True)
+class GoogleOneTimeCreds:
+    """Same Play Console app/service-account as GoogleCreds, but a one-time (managed)
+    product instead of a subscription: `onetimeproducts` has a `purchaseOptions` array
+    playing the same role subscriptions' `basePlans` does, so `purchase_option_id` is the
+    direct analogue of GoogleCreds.baseplan_id."""
+
+    service_account_file: str
+    package_name: str
+    product_id: str
+    purchase_option_id: str
+
+
+@dataclass(frozen=True)
 class AppleCreds:
     issuer_id: str
     key_id: str
@@ -112,7 +125,30 @@ class AppleCreds:
 
 
 @dataclass(frozen=True)
+class AppleOneTimeCreds:
+    """Same App Store Connect key/app as AppleCreds, but an in-app purchase (one-time
+    product) instead of a subscription."""
+
+    issuer_id: str
+    key_id: str
+    private_key: str
+    app_id: str
+    iap_product_id: str
+
+
+@dataclass(frozen=True)
 class StripeCreds:
+    secret_key: str
+    price_id: str
+
+
+@dataclass(frozen=True)
+class StripeOneTimeCreds:
+    """Same Stripe account/secret key as StripeCreds, but a one-time (`type=one_time`)
+    Price instead of a recurring one - currency_options works identically on both, so
+    stripe_platform.py's per-currency logic is shared; only fetch_price()'s
+    recurring-vs-one-time validation differs."""
+
     secret_key: str
     price_id: str
 
@@ -141,9 +177,15 @@ class Settings:
     apple: Optional[AppleCreds]
     pricing: PricingConfig
     stripe: Optional[StripeCreds] = None
+    google_onetime: Optional[GoogleOneTimeCreds] = None
+    apple_onetime: Optional[AppleOneTimeCreds] = None
+    stripe_onetime: Optional[StripeOneTimeCreds] = None
     google_errors: list[str] = field(default_factory=list)
     apple_errors: list[str] = field(default_factory=list)
     stripe_errors: list[str] = field(default_factory=list)
+    google_onetime_errors: list[str] = field(default_factory=list)
+    apple_onetime_errors: list[str] = field(default_factory=list)
+    stripe_onetime_errors: list[str] = field(default_factory=list)
 
     @property
     def google_configured(self) -> bool:
@@ -156,6 +198,18 @@ class Settings:
     @property
     def stripe_configured(self) -> bool:
         return self.stripe is not None
+
+    @property
+    def google_onetime_configured(self) -> bool:
+        return self.google_onetime is not None
+
+    @property
+    def stripe_onetime_configured(self) -> bool:
+        return self.stripe_onetime is not None
+
+    @property
+    def apple_onetime_configured(self) -> bool:
+        return self.apple_onetime is not None
 
 
 def _clean(value: "str | None") -> "str | None":
@@ -209,6 +263,26 @@ def parse_google_creds(env: dict) -> tuple[Optional[GoogleCreds], list[str]]:
     return GoogleCreds(**values), []
 
 
+def parse_google_onetime_creds(env: dict) -> tuple[Optional[GoogleOneTimeCreds], list[str]]:
+    fields = {
+        "service_account_file": ("GOOGLE_SERVICE_ACCOUNT_FILE", "path to the Play Console service-account JSON"),
+        "package_name": ("GOOGLE_PACKAGE_NAME", "app package name"),
+        "product_id": ("GOOGLE_ONETIME_PRODUCT_ID", "one-time product ID"),
+        "purchase_option_id": ("GOOGLE_ONETIME_PURCHASE_OPTION_ID", "purchase option ID within that product"),
+    }
+    values, errors = _collect(env, fields)
+
+    if errors:
+        return None, errors
+
+    account_file = Path(values["service_account_file"])
+    if not account_file.is_file():
+        errors.append(f"GOOGLE_SERVICE_ACCOUNT_FILE points to '{account_file}', which doesn't exist")
+        return None, errors
+
+    return GoogleOneTimeCreds(**values), []
+
+
 def parse_apple_creds(env: dict) -> tuple[Optional[AppleCreds], list[str]]:
     fields = {
         "issuer_id": ("APPLE_ISSUER_ID", "App Store Connect → Users & Access → Keys → Issuer ID"),
@@ -235,6 +309,32 @@ def parse_apple_creds(env: dict) -> tuple[Optional[AppleCreds], list[str]]:
     return AppleCreds(**values), []
 
 
+def parse_apple_onetime_creds(env: dict) -> tuple[Optional[AppleOneTimeCreds], list[str]]:
+    fields = {
+        "issuer_id": ("APPLE_ISSUER_ID", "App Store Connect → Users & Access → Keys → Issuer ID"),
+        "key_id": ("APPLE_KEY_ID", "the API key's Key ID"),
+        "private_key": ("APPLE_PRIVATE_KEY", "the .p8 private key contents"),
+        "app_id": ("APPLE_APP_ID", "numeric App ID"),
+        "iap_product_id": ("APPLE_IAP_PRODUCT_ID", "in-app purchase product ID"),
+    }
+    values, errors = _collect(env, fields)
+
+    if errors:
+        return None, errors
+
+    if values["app_id"] and not values["app_id"].isdigit():
+        errors.append("APPLE_APP_ID should be the numeric App ID, not the bundle ID or subscription group ID")
+
+    key_text = values["private_key"].replace("\\n", "\n")
+    if "BEGIN PRIVATE KEY" not in key_text:
+        errors.append("APPLE_PRIVATE_KEY doesn't look like a PEM private key (missing 'BEGIN PRIVATE KEY')")
+
+    if errors:
+        return None, errors
+
+    return AppleOneTimeCreds(**values), []
+
+
 def parse_stripe_creds(env: dict) -> tuple[Optional[StripeCreds], list[str]]:
     fields = {
         "secret_key": ("STRIPE_SECRET_KEY", "Dashboard -> Developers -> API keys"),
@@ -254,6 +354,27 @@ def parse_stripe_creds(env: dict) -> tuple[Optional[StripeCreds], list[str]]:
         return None, errors
 
     return StripeCreds(**values), []
+
+
+def parse_stripe_onetime_creds(env: dict) -> tuple[Optional[StripeOneTimeCreds], list[str]]:
+    fields = {
+        "secret_key": ("STRIPE_SECRET_KEY", "Dashboard -> Developers -> API keys"),
+        "price_id": ("STRIPE_ONETIME_PRICE_ID", "one-time Price ID for this product (Dashboard -> Product catalog)"),
+    }
+    values, errors = _collect(env, fields)
+
+    if errors:
+        return None, errors
+
+    if not values["secret_key"].startswith(("sk_", "rk_")):
+        errors.append("STRIPE_SECRET_KEY doesn't look like a Stripe secret/restricted key (should start with 'sk_' or 'rk_')")
+    if not values["price_id"].startswith("price_"):
+        errors.append("STRIPE_ONETIME_PRICE_ID doesn't look like a Stripe Price ID (should start with 'price_')")
+
+    if errors:
+        return None, errors
+
+    return StripeOneTimeCreds(**values), []
 
 
 def _load_toml(path: Path) -> dict:
@@ -348,6 +469,9 @@ def load_settings(env_path: Path = ENV_PATH, toml_path: Path = TOML_PATH) -> Set
     google, google_errors = parse_google_creds(env)
     apple, apple_errors = parse_apple_creds(env)
     stripe, stripe_errors = parse_stripe_creds(env)
+    google_onetime, google_onetime_errors = parse_google_onetime_creds(env)
+    apple_onetime, apple_onetime_errors = parse_apple_onetime_creds(env)
+    stripe_onetime, stripe_onetime_errors = parse_stripe_onetime_creds(env)
     pricing = load_pricing_config(toml_path)
 
     return Settings(
@@ -355,7 +479,13 @@ def load_settings(env_path: Path = ENV_PATH, toml_path: Path = TOML_PATH) -> Set
         apple=apple,
         pricing=pricing,
         stripe=stripe,
+        google_onetime=google_onetime,
+        apple_onetime=apple_onetime,
+        stripe_onetime=stripe_onetime,
         google_errors=google_errors,
         apple_errors=apple_errors,
         stripe_errors=stripe_errors,
+        google_onetime_errors=google_onetime_errors,
+        apple_onetime_errors=apple_onetime_errors,
+        stripe_onetime_errors=stripe_onetime_errors,
     )

@@ -63,7 +63,7 @@ def _validate_nonempty(v: str):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pricing.py",
-        description="PPP-adjusted subscription pricing for App Store Connect and Google Play. "
+        description="PPP-adjusted pricing (subscriptions and one-time purchases) for App Store Connect and Google Play. "
                      "Run with no arguments for the guided flow.",
     )
     sub = parser.add_subparsers(dest="command")
@@ -80,9 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_scale.add_argument("--out", default="price_scaled.xlsx")
 
     p_apply = sub.add_parser("apply", help="Push price_scaled.xlsx live to the configured store(s)")
-    p_apply.add_argument("--apple", action="store_true", help="Apply to Apple only")
-    p_apply.add_argument("--google", action="store_true", help="Apply to Google only")
-    p_apply.add_argument("--stripe", action="store_true", help="Apply to Stripe only")
+    p_apply.add_argument("--apple", action="store_true", help="Apply to Apple (subscription) only")
+    p_apply.add_argument("--google", action="store_true", help="Apply to Google (subscription) only")
+    p_apply.add_argument("--stripe", action="store_true", help="Apply to Stripe (subscription) only")
+    p_apply.add_argument("--apple-iap", action="store_true", help="Apply to Apple's one-time in-app purchase only")
+    p_apply.add_argument("--google-iap", action="store_true", help="Apply to Google's one-time product only")
+    p_apply.add_argument("--stripe-onetime", action="store_true", help="Apply to Stripe's one-time Price only")
     p_apply.add_argument("--dry-run", action="store_true", help="Resolve everything but never submit a change")
     p_apply.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (for CI)")
 
@@ -115,7 +118,30 @@ def ensure_data_fresh(settings: Settings, force: bool = False) -> None:
 
 def _available_platform_names(settings: Settings) -> list[str]:
     """Configured platforms, in a stable display order - shared by the guided flow's push
-    prompt and the offer command's platform picker so both offer the same set of choices."""
+    prompt and the apply command's platform resolution so both offer the same set of
+    choices. A store's subscription label only gets a "(Subscription)" qualifier when its
+    one-time-purchase counterpart is *also* configured - the common single-product case
+    reads exactly as it did before one-time purchase support existed."""
+    names = []
+    if settings.apple_configured:
+        names.append("Apple (Subscription)" if settings.apple_onetime_configured else "Apple")
+    if settings.apple_onetime_configured:
+        names.append("Apple (One-time)")
+    if settings.google_configured:
+        names.append("Google (Subscription)" if settings.google_onetime_configured else "Google")
+    if settings.google_onetime_configured:
+        names.append("Google (One-time)")
+    if settings.stripe_configured:
+        names.append("Stripe (Subscription)" if settings.stripe_onetime_configured else "Stripe")
+    if settings.stripe_onetime_configured:
+        names.append("Stripe (One-time)")
+    return names
+
+
+def _available_offer_platform_names(settings: Settings) -> list[str]:
+    """Subscription-only subset of _available_platform_names() for `pricing.py offer` -
+    a percentage-off-for-N-cycles promotional offer has no direct analogue for a one-time
+    purchase, so those targets are never offered here."""
     names = []
     if settings.apple_configured:
         names.append("Apple")
@@ -126,8 +152,18 @@ def _available_platform_names(settings: Settings) -> list[str]:
     return names
 
 
-def _resolve_platforms(settings: Settings, want_apple: bool, want_google: bool, want_stripe: bool = False) -> set[str]:
-    if want_apple or want_google or want_stripe:
+def _platform_key(name: str) -> str:
+    """Map a display name from _available_platform_names() back to the internal key used
+    everywhere else (apple/apple_onetime/google/google_onetime/stripe)."""
+    base = name.split(" (")[0].lower()
+    return f"{base}_onetime" if name.endswith("(One-time)") else base
+
+
+def _resolve_platforms(
+    settings: Settings, want_apple: bool, want_google: bool, want_stripe: bool = False,
+    want_apple_iap: bool = False, want_google_iap: bool = False, want_stripe_onetime: bool = False,
+) -> set[str]:
+    if want_apple or want_google or want_stripe or want_apple_iap or want_google_iap or want_stripe_onetime:
         platforms = set()
         if want_apple:
             if settings.apple_configured:
@@ -144,9 +180,24 @@ def _resolve_platforms(settings: Settings, want_apple: bool, want_google: bool, 
                 platforms.add("stripe")
             else:
                 console.print("[red]--stripe requested but Stripe isn't configured.[/red]")
+        if want_apple_iap:
+            if settings.apple_onetime_configured:
+                platforms.add("apple_onetime")
+            else:
+                console.print("[red]--apple-iap requested but Apple one-time purchase isn't configured.[/red]")
+        if want_google_iap:
+            if settings.google_onetime_configured:
+                platforms.add("google_onetime")
+            else:
+                console.print("[red]--google-iap requested but Google one-time purchase isn't configured.[/red]")
+        if want_stripe_onetime:
+            if settings.stripe_onetime_configured:
+                platforms.add("stripe_onetime")
+            else:
+                console.print("[red]--stripe-onetime requested but Stripe one-time purchase isn't configured.[/red]")
         return platforms
 
-    return {name.lower() for name in _available_platform_names(settings)}
+    return {_platform_key(name) for name in _available_platform_names(settings)}
 
 
 def _report(failures: list[dict], dry_run: bool = False) -> int:
@@ -189,6 +240,28 @@ def _apply_flow(settings: Settings, platforms: set[str], dry_run: bool = False, 
         console.print(table)
         total_applyable += applyable
         total_locked += locked
+    if "google_onetime" in platforms:
+        console.print("Fetching live Google Play one-time prices for comparison...")
+        live = google_api.fetch_live_onetime_prices(settings.google_onetime, data)
+        try:
+            usd_rates = scaler.fetch_all_usd_rates()
+        except Exception as e:
+            console.print(f"[dim]Warning: could not fetch exchange rates ({e}) - currency mismatches will show as locked.[/dim]")
+            usd_rates = {}
+        table, applyable, locked = diff_table(
+            "Google Play (One-time)", live, data.country_prices, data.country_currencies,
+            currency_mismatch_blocks=True, usd_rates=usd_rates, country_prices_usd=data.country_prices_usd,
+        )
+        console.print(table)
+        total_applyable += applyable
+        total_locked += locked
+    if "apple_onetime" in platforms:
+        console.print("Fetching live App Store in-app purchase prices for comparison...")
+        live = apple_api.fetch_live_iap_prices(settings.apple_onetime, data, settings.pricing)
+        table, applyable, locked = diff_table("Apple App Store (One-time)", live, data.country_prices, data.country_currencies)
+        console.print(table)
+        total_applyable += applyable
+        total_locked += locked
     if "stripe" in platforms:
         console.print("Fetching live Stripe prices for comparison...")
         price, error = stripe_api.fetch_price(settings.stripe)
@@ -199,6 +272,26 @@ def _apply_flow(settings: Settings, platforms: set[str], dry_run: bool = False, 
             _, locked_countries = stripe_api.resolve_currency_options(data, settings.pricing, price["currency"])
             pushable_prices = {c: p for c, p in data.country_prices.items() if c not in locked_countries}
             table, applyable, _ = diff_table("Stripe", live, pushable_prices, data.country_currencies)
+            console.print(table)
+            total_applyable += applyable
+            if locked_countries:
+                console.print(
+                    f"[dim]{len(locked_countries)} countries share Stripe's base Price currency "
+                    f"({price['currency'].upper()}) and can't be changed via the API - create a new "
+                    f"Price to update it.[/dim]"
+                )
+    if "stripe_onetime" in platforms:
+        console.print("Fetching live Stripe one-time prices for comparison...")
+        price, error = stripe_api.fetch_onetime_price(settings.stripe_onetime)
+        if error:
+            console.print(f"[red]{error}[/red]")
+        else:
+            live = stripe_api.fetch_live_onetime_prices(settings.stripe_onetime, data)
+            _, locked_countries = stripe_api.resolve_currency_options(
+                data, settings.pricing, price["currency"], price_id_var="STRIPE_ONETIME_PRICE_ID",
+            )
+            pushable_prices = {c: p for c, p in data.country_prices.items() if c not in locked_countries}
+            table, applyable, _ = diff_table("Stripe (One-time)", live, pushable_prices, data.country_currencies)
             console.print(table)
             total_applyable += applyable
             if locked_countries:
@@ -231,8 +324,14 @@ def _apply_flow(settings: Settings, platforms: set[str], dry_run: bool = False, 
         failures += google_api.update_prices(settings.google, settings.pricing, data, dry_run=dry_run)
     if "apple" in platforms:
         failures += apple_api.update_prices(settings.apple, settings.pricing, data, dry_run=dry_run)
+    if "google_onetime" in platforms:
+        failures += google_api.update_onetime_prices(settings.google_onetime, settings.pricing, data, dry_run=dry_run)
+    if "apple_onetime" in platforms:
+        failures += apple_api.update_iap_prices(settings.apple_onetime, settings.pricing, data, dry_run=dry_run)
     if "stripe" in platforms:
         failures += stripe_api.update_prices(settings.stripe, settings.pricing, data, dry_run=dry_run)
+    if "stripe_onetime" in platforms:
+        failures += stripe_api.update_onetime_prices(settings.stripe_onetime, settings.pricing, data, dry_run=dry_run)
 
     return _report(failures, dry_run=dry_run)
 
@@ -264,12 +363,12 @@ def guided_flow() -> int:
     if len(available) == 1:
         if not confirm(f"Push these prices live to {available[0]}?", default=False):
             return 0
-        platforms = {available[0].lower()}
+        platforms = {_platform_key(available[0])}
     else:
-        chosen = checkbox("Push these prices live? Select store(s) (leave empty for just the spreadsheet):", available, allow_empty=True)
+        chosen = checkbox("Push these prices live? Select target(s) (leave empty for just the spreadsheet):", available, allow_empty=True)
         if not chosen:
             return 0
-        platforms = {c.lower() for c in chosen}
+        platforms = {_platform_key(c) for c in chosen}
 
     mode = select("How?", [
         "Preview the diff, then ask for confirmation before pushing",
@@ -296,7 +395,10 @@ def cmd_scale(args) -> int:
 
 def cmd_apply(args) -> int:
     settings = load_settings()
-    platforms = _resolve_platforms(settings, args.apple, args.google, args.stripe)
+    platforms = _resolve_platforms(
+        settings, args.apple, args.google, args.stripe,
+        want_apple_iap=args.apple_iap, want_google_iap=args.google_iap, want_stripe_onetime=args.stripe_onetime,
+    )
     if not platforms:
         console.print("[red]No configured platform available. Run `pricing.py setup`.[/red]")
         return 1
@@ -304,10 +406,12 @@ def cmd_apply(args) -> int:
 
 
 def _select_offer_platforms(settings: Settings, args) -> set[str]:
+    # Promotional offers are subscription-only (see _available_offer_platform_names) - a
+    # one-time purchase has no percentage-off-for-N-cycles concept to map this onto.
     if args.apple or args.google or args.stripe:
         return _resolve_platforms(settings, args.apple, args.google, args.stripe)
 
-    available = _available_platform_names(settings)
+    available = _available_offer_platform_names(settings)
     if not available:
         return set()
     if len(available) == 1:

@@ -5,15 +5,18 @@ ladder that drops a currency Stripe rejects rather than failing the whole patch.
 
 import stripe
 
-from store_pricing.config import PricingConfig, StripeCreds
+from store_pricing.config import PricingConfig, StripeCreds, StripeOneTimeCreds
 from store_pricing.inputs import InputData
 from store_pricing.offers import OfferConfig, create_stripe_offer
 from store_pricing.stripe_platform import (
     _dropped_currency,
+    fetch_onetime_price,
+    fetch_price,
     from_smallest_unit,
     months_for_period,
     resolve_currency_options,
     to_smallest_unit,
+    update_onetime_prices,
     update_prices,
 )
 
@@ -159,8 +162,26 @@ class _FakeClient:
         self.v1 = _FakeV1(prices)
 
 
+class _StripeObjectStub(dict):
+    """Minimal stand-in for stripe-python's StripeObject: item access (price["currency"])
+    *and* attribute access (getattr(price, "recurring", None)) both read the same keys.
+
+    A plain dict only gives you the former - getattr() on a plain dict never finds a
+    "recurring" attribute regardless of what's in the dict, silently defaulting to None
+    every time. _fetch_price() relies on attribute access specifically (see its comment),
+    so a plain-dict stub would make every price look non-recurring no matter what "recurring"
+    was set to - this class is what makes these stubs actually exercise that code path.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
 def _price_stub(currency="USD"):
-    return {"id": "price_123", "currency": currency, "recurring": {"interval": "month"}, "currency_options": {}}
+    return _StripeObjectStub(id="price_123", currency=currency, recurring={"interval": "month"}, currency_options={})
 
 
 def test_update_prices_drops_the_rejected_currency_and_retries(monkeypatch):
@@ -198,6 +219,97 @@ def test_update_prices_reports_locked_base_currency_countries(monkeypatch):
     assert len(failures) == 1
     assert failures[0]["country"] == "United States"
     assert "currency_options" in failures[0]["reason"]
+
+
+# --- fetch_price()/fetch_onetime_price(): recurring-vs-one-time validation ---
+
+class _FakeRetrievePrices:
+    def __init__(self, price):
+        self._price = price
+
+    def retrieve(self, price_id, params=None):
+        return self._price
+
+
+def _onetime_price_stub(currency="USD"):
+    return _StripeObjectStub(id="price_456", currency=currency, recurring=None, currency_options={})
+
+
+def test_fetch_price_rejects_a_one_time_price(monkeypatch):
+    creds = StripeCreds(secret_key="sk_test_x", price_id="price_456")
+    monkeypatch.setattr(
+        "store_pricing.stripe_platform.build_client",
+        lambda c: _FakeClient(_FakeRetrievePrices(_onetime_price_stub())),
+    )
+
+    price, error = fetch_price(creds)
+
+    assert price is None
+    assert "not a recurring price" in error
+
+
+def test_fetch_onetime_price_rejects_a_recurring_price(monkeypatch):
+    creds = StripeOneTimeCreds(secret_key="sk_test_x", price_id="price_123")
+    monkeypatch.setattr(
+        "store_pricing.stripe_platform.build_client",
+        lambda c: _FakeClient(_FakeRetrievePrices(_price_stub())),
+    )
+
+    price, error = fetch_onetime_price(creds)
+
+    assert price is None
+    assert "recurring price" in error
+
+
+def test_fetch_onetime_price_accepts_a_one_time_price(monkeypatch):
+    creds = StripeOneTimeCreds(secret_key="sk_test_x", price_id="price_456")
+    monkeypatch.setattr(
+        "store_pricing.stripe_platform.build_client",
+        lambda c: _FakeClient(_FakeRetrievePrices(_onetime_price_stub())),
+    )
+
+    price, error = fetch_onetime_price(creds)
+
+    assert error is None
+    assert price["id"] == "price_456"
+
+
+# --- update_onetime_prices(): same retry ladder, tagged with a distinct platform label ---
+
+def test_update_onetime_prices_drops_the_rejected_currency_and_retries(monkeypatch):
+    creds = StripeOneTimeCreds(secret_key="sk_test_x", price_id="price_456")
+
+    data = _data(
+        {"Norway": 99.0, "Germany": 8.99},
+        {"Norway": "NOK", "Germany": "EUR"},
+    )
+
+    fake_prices = _FakePrices(_onetime_price_stub(), fail_currency="nok")
+    monkeypatch.setattr("store_pricing.stripe_platform.fetch_onetime_price", lambda c: (_onetime_price_stub(), None))
+    monkeypatch.setattr("store_pricing.stripe_platform.build_client", lambda c: _FakeClient(fake_prices))
+
+    failures = update_onetime_prices(creds, PricingConfig(), data, dry_run=False)
+
+    assert len(fake_prices.update_calls) == 2
+    assert "nok" in fake_prices.update_calls[0]["currency_options"]
+    assert "nok" not in fake_prices.update_calls[1]["currency_options"]
+    assert any(f["country"] == "Norway" and "Rejected by Stripe" in f["reason"] for f in failures)
+    # Distinct platform label so this doesn't collapse into the subscription's "Stripe"
+    # bucket in the failure report when both are pushed in the same run.
+    assert all(f["platform"] == "Stripe (One-time)" for f in failures)
+
+
+def test_update_onetime_prices_locked_country_message_points_at_the_onetime_env_var(monkeypatch):
+    creds = StripeOneTimeCreds(secret_key="sk_test_x", price_id="price_456")
+    data = _data({"United States": 9.99}, {"United States": "USD"})
+
+    monkeypatch.setattr("store_pricing.stripe_platform.fetch_onetime_price", lambda c: (_onetime_price_stub("USD"), None))
+
+    failures = update_onetime_prices(creds, PricingConfig(), data, dry_run=True)
+
+    assert len(failures) == 1
+    assert failures[0]["platform"] == "Stripe (One-time)"
+    assert "STRIPE_ONETIME_PRICE_ID" in failures[0]["reason"]
 
 
 # --- create_stripe_offer ---

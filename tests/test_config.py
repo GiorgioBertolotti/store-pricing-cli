@@ -14,7 +14,14 @@ Two classes of regression are covered here:
 
 import pytest
 
-from store_pricing.config import ConfigError, load_pricing_config, load_settings, parse_stripe_creds
+from store_pricing.config import (
+    ConfigError,
+    load_pricing_config,
+    load_settings,
+    parse_apple_onetime_creds,
+    parse_google_onetime_creds,
+    parse_stripe_creds,
+)
 
 GOOGLE_ENV = {
     "GOOGLE_SERVICE_ACCOUNT_FILE": "service-account.json",
@@ -31,6 +38,8 @@ def clean_env(monkeypatch):
     for key in list(GOOGLE_ENV) + [
         "APPLE_ISSUER_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY",
         "APPLE_APP_ID", "APPLE_SUBSCRIPTION_PRODUCT_ID",
+        "GOOGLE_ONETIME_PRODUCT_ID", "GOOGLE_ONETIME_PURCHASE_OPTION_ID",
+        "APPLE_IAP_PRODUCT_ID",
     ]:
         monkeypatch.delenv(key, raising=False)
     return monkeypatch
@@ -181,6 +190,67 @@ def test_negative_vat_override_is_rejected_and_names_the_country(tmp_path):
 
     with pytest.raises(ConfigError, match="Germany"):
         load_pricing_config(path)
+
+
+# --- credentials: one-time products (independent of subscription config) ---
+
+def test_google_onetime_creds_do_not_require_subscription_vars(clean_env, tmp_path):
+    account = _service_account(tmp_path)
+    creds, errors = parse_google_onetime_creds({
+        "GOOGLE_SERVICE_ACCOUNT_FILE": str(account),
+        "GOOGLE_PACKAGE_NAME": "com.acme.app",
+        "GOOGLE_ONETIME_PRODUCT_ID": "lifetime_unlock",
+        "GOOGLE_ONETIME_PURCHASE_OPTION_ID": "buy",
+    })
+
+    assert errors == []
+    assert creds.product_id == "lifetime_unlock"
+    assert creds.purchase_option_id == "buy"
+
+
+def test_apple_onetime_creds_do_not_require_subscription_vars(clean_env):
+    creds, errors = parse_apple_onetime_creds({
+        "APPLE_ISSUER_ID": "11111111-1111-1111-1111-111111111111",
+        "APPLE_KEY_ID": "ABC123",
+        "APPLE_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
+        "APPLE_APP_ID": "123456789",
+        "APPLE_IAP_PRODUCT_ID": "lifetime_unlock",
+    })
+
+    assert errors == []
+    assert creds.iap_product_id == "lifetime_unlock"
+
+
+def test_settings_can_have_both_subscription_and_onetime_configured_for_the_same_store(clean_env, tmp_path):
+    account = _service_account(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"GOOGLE_SERVICE_ACCOUNT_FILE={account}\n"
+        "GOOGLE_PACKAGE_NAME=com.acme.app\n"
+        "GOOGLE_SUBSCRIPTION_ID=premium\n"
+        "GOOGLE_BASEPLAN_ID=monthly\n"
+        "GOOGLE_ONETIME_PRODUCT_ID=lifetime_unlock\n"
+        "GOOGLE_ONETIME_PURCHASE_OPTION_ID=buy\n"
+    )
+
+    settings = load_settings(env_path=env_file, toml_path=tmp_path / "nonexistent.toml")
+
+    assert settings.google_configured
+    assert settings.google_onetime_configured
+    assert settings.google.subscription_id == "premium"
+    assert settings.google_onetime.product_id == "lifetime_unlock"
+
+
+def test_onetime_not_configured_does_not_block_subscription(clean_env, tmp_path):
+    account = _service_account(tmp_path)
+    for key, value in {**GOOGLE_ENV, "GOOGLE_SERVICE_ACCOUNT_FILE": str(account)}.items():
+        clean_env.setenv(key, value)
+
+    settings = load_settings(env_path=tmp_path / "nonexistent.env", toml_path=tmp_path / "nonexistent.toml")
+
+    assert settings.google_configured
+    assert not settings.google_onetime_configured
+    assert len(settings.google_onetime_errors) == 2  # only the two one-time-specific vars
 
 
 def test_valid_overrides_are_parsed(tmp_path):

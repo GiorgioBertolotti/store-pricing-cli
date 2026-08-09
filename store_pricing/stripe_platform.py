@@ -1,10 +1,16 @@
-"""Stripe regional subscription prices.
+"""Stripe regional prices - subscriptions and one-time purchases alike.
 
-Unlike Apple/Google, Stripe recurring Prices have no per-country pricing - only
-per-currency, via `currency_options` on a single Price object. The Price's own
-default currency/unit_amount is immutable once created (Stripe Prices in general are
-immutable); `currency_options` is the one field on an existing Price the API still lets
-you patch, so that's what this module writes to.
+Unlike Apple/Google, a Stripe Price has no per-country pricing - only per-currency, via
+`currency_options` on a single Price object. The Price's own default currency/unit_amount
+is immutable once created (Stripe Prices in general are immutable); `currency_options` is
+the one field on an existing Price the API still lets you patch, so that's what this
+module writes to. This mechanism works identically whether the Price is recurring
+(subscription) or `type=one_time` (one-time purchase) - Stripe doesn't distinguish between
+the two for currency_options at all, so update_prices()/update_onetime_prices() and
+fetch_live_prices()/fetch_live_onetime_prices() share one implementation
+(_update_prices_for()/_fetch_live_prices_for()) parameterized only by which fetch_*_price()
+function validates the Price's recurring-vs-one-time-ness and which platform label its
+failures get tagged with.
 
 Pricing is therefore resolved by currency, not by country: every country sharing a
 currency gets that currency's one Stripe amount. Where PPP scaling would want different
@@ -16,6 +22,10 @@ prices are averaged.
 Countries priced in the base Price's own currency can't be represented via
 currency_options at all - they come back from resolve_currency_options() as "locked",
 the same concept apply_flow already shows for Google's currency-locked regions.
+
+Promotional offers (offers.py) stay subscription-only: a Stripe Coupon's
+duration_in_months needs a recurring billing cadence to discount across, which a one-time
+purchase doesn't have.
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from statistics import mean
 
 import stripe
 
-from store_pricing.config import PricingConfig, StripeCreds
+from store_pricing.config import PricingConfig, StripeCreds, StripeOneTimeCreds
 from store_pricing.inputs import InputData
 from store_pricing.report import make_failure
 
@@ -50,7 +60,16 @@ def _make_failure(country, country_code, price, currency, reason) -> dict:
     return make_failure("Stripe", country, country_code, price, currency, reason)
 
 
-def build_client(creds: StripeCreds) -> stripe.StripeClient:
+def _make_onetime_failure(country, country_code, price, currency, reason) -> dict:
+    # A distinct platform label from _make_failure()'s "Stripe" - otherwise a run that
+    # applies both the subscription and the one-time Price in the same invocation merges
+    # their failures into one indistinguishable "Stripe" bucket in the failure report and
+    # the console summary table (same fix as apple._make_iap_failure()/
+    # google._make_onetime_failure()).
+    return make_failure("Stripe (One-time)", country, country_code, price, currency, reason)
+
+
+def build_client(creds: "StripeCreds | StripeOneTimeCreds") -> stripe.StripeClient:
     return stripe.StripeClient(api_key=creds.secret_key)
 
 
@@ -66,7 +85,7 @@ def from_smallest_unit(amount: int, currency: str) -> float:
     return amount / 100
 
 
-def fetch_price(creds: StripeCreds) -> "tuple":
+def _fetch_price(creds, *, require_recurring: bool) -> "tuple":
     """Retrieve the configured Price. Returns (price, error) - error is None on success.
 
     `expand=["currency_options"]` is required - Stripe omits that field from the response
@@ -82,10 +101,21 @@ def fetch_price(creds: StripeCreds) -> "tuple":
     # stripe-python's StripeObject no longer subclasses dict (as of the v8 SDK rewrite),
     # so it has no .get() - only attribute/item access (__getattr__ proxies to __getitem__
     # and raises AttributeError, which is what makes getattr()'s default work here).
-    if not getattr(price, "recurring", None):
+    is_recurring = bool(getattr(price, "recurring", None))
+    if require_recurring and not is_recurring:
         return None, f"Stripe Price '{creds.price_id}' is not a recurring price - a subscription needs a recurring Price"
+    if not require_recurring and is_recurring:
+        return None, f"Stripe Price '{creds.price_id}' is a recurring price - a one-time purchase needs a one-time Price"
 
     return price, None
+
+
+def fetch_price(creds: StripeCreds) -> "tuple":
+    return _fetch_price(creds, require_recurring=True)
+
+
+def fetch_onetime_price(creds: StripeOneTimeCreds) -> "tuple":
+    return _fetch_price(creds, require_recurring=False)
 
 
 def group_by_currency(data: InputData) -> dict[str, list[str]]:
@@ -106,11 +136,17 @@ def _resolve_group_price(countries: list[str], data: InputData, anchor_country: 
     return mean(data.country_prices[c] for c in countries)
 
 
-def resolve_currency_options(data: InputData, pricing: PricingConfig, base_currency: str) -> "tuple[dict, dict]":
+def resolve_currency_options(
+    data: InputData, pricing: PricingConfig, base_currency: str, price_id_var: str = "STRIPE_PRICE_ID",
+) -> "tuple[dict, dict]":
     """Build the currency_options patch plus the country -> reason map of countries that
     can't be represented (those priced in the base Price's own currency).
 
     Returns ({currency_lower: {"unit_amount": int}}, {country: reason}).
+
+    `price_id_var` only changes the locked-country message's suggested fix - pass
+    "STRIPE_ONETIME_PRICE_ID" for the one-time Price path so the advice points at the right
+    .env variable, since both share this function's currency-collision logic verbatim.
     """
     base_currency = base_currency.upper()
     groups = group_by_currency(data)
@@ -122,7 +158,7 @@ def resolve_currency_options(data: InputData, pricing: PricingConfig, base_curre
         if currency == base_currency:
             reason = (
                 f"Stripe's base Price currency ({base_currency}) can't be changed in place via "
-                f"currency_options - create a new Price to change it, then update STRIPE_PRICE_ID"
+                f"currency_options - create a new Price to change it, then update {price_id_var}"
             )
             for country in countries:
                 locked[country] = reason
@@ -134,11 +170,13 @@ def resolve_currency_options(data: InputData, pricing: PricingConfig, base_curre
     return currency_options, locked
 
 
-def fetch_live_prices(creds: StripeCreds, data: InputData) -> dict[str, dict]:
+def _fetch_live_prices_for(creds, fetch_fn, data: InputData) -> dict[str, dict]:
     """{country: {"price": float, "currency": str}} for every country we can read back -
     the base Price's own currency/unit_amount for countries priced in it, its
-    currency_options for everyone else. Used for the apply-time diff."""
-    price, error = fetch_price(creds)
+    currency_options for everyone else. Used for the apply-time diff. Shared by
+    fetch_live_prices() (subscription) and fetch_live_onetime_prices() (one-time) -
+    currency_options works identically on both kinds of Price."""
+    price, error = fetch_fn(creds)
     if error:
         return {}
 
@@ -158,6 +196,14 @@ def fetch_live_prices(creds: StripeCreds, data: InputData) -> dict[str, dict]:
             live[country] = {"price": from_smallest_unit(entry["unit_amount"], currency_upper), "currency": currency_upper}
 
     return live
+
+
+def fetch_live_prices(creds: StripeCreds, data: InputData) -> dict[str, dict]:
+    return _fetch_live_prices_for(creds, fetch_price, data)
+
+
+def fetch_live_onetime_prices(creds: StripeOneTimeCreds, data: InputData) -> dict[str, dict]:
+    return _fetch_live_prices_for(creds, fetch_onetime_price, data)
 
 
 _INVALID_CURRENCY_RE = re.compile(r"Invalid currency:\s*(\w+)")
@@ -181,18 +227,24 @@ def _dropped_currency(e: "stripe.error.StripeError") -> "str | None":
     return match.group(1).lower() if match else None
 
 
-def update_prices(creds: StripeCreds, config: PricingConfig, data: InputData, dry_run: bool = False) -> list[dict]:
-    price, error = fetch_price(creds)
+def _update_prices_for(
+    creds, fetch_fn, make_failure_fn, price_id_var: str,
+    config: PricingConfig, data: InputData, dry_run: bool = False,
+) -> list[dict]:
+    """Shared by update_prices() (subscription) and update_onetime_prices() (one-time) -
+    the currency_options patch-and-retry-dropping-rejected-currencies ladder doesn't care
+    whether the underlying Price is recurring or one-time."""
+    price, error = fetch_fn(creds)
     if error:
         print(error)
-        return [_make_failure("N/A", "N/A", None, None, error)]
+        return [make_failure_fn("N/A", "N/A", None, None, error)]
 
     base_currency = price["currency"].upper()
     groups = group_by_currency(data)
-    currency_options, locked = resolve_currency_options(data, config, base_currency)
+    currency_options, locked = resolve_currency_options(data, config, base_currency, price_id_var)
 
     failures = [
-        _make_failure(country, data.country_currencies.get(country), data.country_prices.get(country), base_currency, reason)
+        make_failure_fn(country, data.country_currencies.get(country), data.country_prices.get(country), base_currency, reason)
         for country, reason in locked.items()
     ]
 
@@ -221,16 +273,24 @@ def update_prices(creds: StripeCreds, config: PricingConfig, data: InputData, dr
             if dropped is None or dropped not in remaining:
                 reason = f"API error: {e}"
                 print(reason)
-                return failures + [_make_failure("N/A", "N/A", None, None, reason)]
+                return failures + [make_failure_fn("N/A", "N/A", None, None, reason)]
 
             del remaining[dropped]
             affected = currency_to_countries.get(dropped, [])
             print(f"   Stripe rejected currency {dropped.upper()} - dropping it and retrying (attempt {attempt + 1})")
             failures += [
-                _make_failure(country, dropped.upper(), data.country_prices.get(country), dropped.upper(), f"Rejected by Stripe: {e}")
+                make_failure_fn(country, dropped.upper(), data.country_prices.get(country), dropped.upper(), f"Rejected by Stripe: {e}")
                 for country in affected
             ]
             if not remaining:
                 return failures
 
-    return failures + [_make_failure("N/A", "N/A", None, None, "Could not resolve all API errors - too many currencies rejected")]
+    return failures + [make_failure_fn("N/A", "N/A", None, None, "Could not resolve all API errors - too many currencies rejected")]
+
+
+def update_prices(creds: StripeCreds, config: PricingConfig, data: InputData, dry_run: bool = False) -> list[dict]:
+    return _update_prices_for(creds, fetch_price, _make_failure, "STRIPE_PRICE_ID", config, data, dry_run)
+
+
+def update_onetime_prices(creds: StripeOneTimeCreds, config: PricingConfig, data: InputData, dry_run: bool = False) -> list[dict]:
+    return _update_prices_for(creds, fetch_onetime_price, _make_onetime_failure, "STRIPE_ONETIME_PRICE_ID", config, data, dry_run)

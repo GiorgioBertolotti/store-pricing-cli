@@ -29,6 +29,9 @@ def write_failure_report(failures: list[dict]) -> "Path | None":
     google_failures = [f for f in failures if f["platform"] == "Google Play"]
     apple_failures = [f for f in failures if f["platform"] == "Apple App Store"]
     stripe_failures = [f for f in failures if f["platform"] == "Stripe"]
+    google_onetime_failures = [f for f in failures if f["platform"] == "Google Play (One-time)"]
+    apple_onetime_failures = [f for f in failures if f["platform"] == "Apple App Store (One-time)"]
+    stripe_onetime_failures = [f for f in failures if f["platform"] == "Stripe (One-time)"]
 
     with path.open("w") as f:
         f.write("PRICE UPDATE FAILURE REPORT\n")
@@ -37,9 +40,12 @@ def write_failure_report(failures: list[dict]) -> "Path | None":
         f.write(f"Total failures: {len(failures)}\n\n")
 
         for label, group in (
-            ("GOOGLE PLAY FAILURES", google_failures),
-            ("APPLE APP STORE FAILURES", apple_failures),
-            ("STRIPE FAILURES", stripe_failures),
+            ("GOOGLE PLAY FAILURES (SUBSCRIPTION)" if google_onetime_failures else "GOOGLE PLAY FAILURES", google_failures),
+            ("GOOGLE PLAY FAILURES (ONE-TIME)", google_onetime_failures),
+            ("APPLE APP STORE FAILURES (SUBSCRIPTION)" if apple_onetime_failures else "APPLE APP STORE FAILURES", apple_failures),
+            ("APPLE APP STORE FAILURES (ONE-TIME)", apple_onetime_failures),
+            ("STRIPE FAILURES (SUBSCRIPTION)" if stripe_onetime_failures else "STRIPE FAILURES", stripe_failures),
+            ("STRIPE FAILURES (ONE-TIME)", stripe_onetime_failures),
         ):
             if not group:
                 continue

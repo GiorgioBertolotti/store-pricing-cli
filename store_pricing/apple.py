@@ -18,6 +18,22 @@ AppleCreds rather than read from module globals, plus one bug fix: update_prices
 return an empty (non-failing) list when the subscription couldn't be found, which made a
 misconfigured APPLE_SUBSCRIPTION_PRODUCT_ID look like "all succeeded". It now returns an
 explicit failure record, matching the Google path.
+
+One-time in-app purchase pricing (update_iap_prices() and friends, below the subscription
+functions) uses a structurally different Apple API: price-point resolution mirrors the
+subscription path almost exactly (same request/response shape, just under
+/v2/inAppPurchases/.../pricePoints instead of /v1/subscriptions/.../pricePoints), but there
+is no per-territory PATCH equivalent to subscriptionPrices - an in-app purchase has exactly
+one InAppPurchasePriceSchedule, and the only documented way to change it is POST
+/v1/inAppPurchasePriceSchedules with a manualPrices entry for *every* territory being
+priced in one request. That makes update_iap_prices() all-or-nothing at the HTTP level:
+if Apple rejects the schedule, none of the territories in that batch were updated, not
+just the one that triggered the error - see the comment in update_iap_prices() for how
+failures are reported for that case. This shape was confirmed against Apple's official
+OpenAPI spec (developer.apple.com's published spec, cross-checked via
+github.com/EvanBacon/App-Store-Connect-OpenAPI-Spec), but - unlike the subscription
+offers payload in offers.py - has not been exercised against a live schedule that already
+has prices, so submitting a second schedule after the first one hasn't been confirmed live.
 """
 
 from __future__ import annotations
@@ -31,12 +47,15 @@ from datetime import datetime, timedelta, timezone
 import jwt
 import requests
 
-from store_pricing.config import AppleCreds, PricingConfig
+from store_pricing.config import AppleCreds, AppleOneTimeCreds, PricingConfig
 from store_pricing.inputs import InputData, get_alpha_3_country_code
 from store_pricing.report import make_failure
 from store_pricing.scaler import convert_to_currency, fetch_all_usd_rates
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
+# One-time in-app purchase pricing (pricePoints, iapPriceSchedule) only exists under v2 -
+# subscriptions still live entirely under v1.
+BASE_URL_V2 = "https://api.appstoreconnect.apple.com/v2"
 
 # Apple sometimes requires startDate to be further out than "tomorrow" (e.g. price changes
 # already scheduled, or a stricter minimum lead time than documented); it tells us the
@@ -140,7 +159,7 @@ def _make_failure(country, country_code, price, currency, reason) -> dict:
     return make_failure("Apple App Store", country, country_code, price, currency, reason)
 
 
-def get_jwt(creds: AppleCreds) -> str:
+def get_jwt(creds: "AppleCreds | AppleOneTimeCreds") -> str:
     headers = {"alg": "ES256", "kid": creds.key_id, "typ": "JWT"}
     payload = {"iss": creds.issuer_id, "exp": int(time.time()) + 1200, "aud": "appstoreconnect-v1"}
     private_key = creds.private_key.replace("\\n", "\n")
@@ -167,6 +186,21 @@ def get_subscription_id(token: str, creds: AppleCreds) -> "str | None":
     return None
 
 
+def get_iap_id(token: str, creds: AppleOneTimeCreds) -> "str | None":
+    """Find the in-app purchase's resource id by its productId. Unlike subscriptions
+    (which need a subscriptionGroups -> subscriptions walk since productId isn't directly
+    filterable there), inAppPurchasesV2 supports filter[productId] directly."""
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{BASE_URL}/apps/{creds.app_id}/inAppPurchasesV2?filter[productId]={creds.iap_product_id}&limit=1"
+    resp = _get_with_rate_limit(url, headers)
+    if resp.status_code != 200:
+        print(f"Error fetching in-app purchases for {creds.app_id}: {resp.text}")
+        return None
+
+    data = resp.json().get("data", [])
+    return data[0]["id"] if data else None
+
+
 def get_closest_price_point(token, subscription_id, country_code, target_price, expected_currency=None):
     """Get the closest available price point for a territory.
 
@@ -183,15 +217,25 @@ def get_closest_price_point(token, subscription_id, country_code, target_price, 
     "no matching price point" tells the operator the territory is unpriceable when the
     real answer is "try again". They need to know which countries to re-run.
     """
-    headers = {"Authorization": f"Bearer {token}"}
     url = (
         f"{BASE_URL}/subscriptions/{subscription_id}/pricePoints"
         f"?include=territory&filter[territory]={country_code}&limit=1000"
     )
+    return _closest_price_point_for_token(token, url, country_code, float(target_price), expected_currency)
 
-    # This runs once per country under a ThreadPoolExecutor (see update_prices/
-    # create_apple_offer), so a run against ~150+ territories can trip Apple's
-    # undocumented rate limit (observed: 429 RATE_LIMIT_EXCEEDED).
+
+def get_closest_iap_price_point(token, iap_id, country_code, target_price, expected_currency=None):
+    """In-app purchase equivalent of get_closest_price_point() - same return contract, but
+    against /v2/inAppPurchases/{id}/pricePoints (v2; subscriptions are v1)."""
+    url = (
+        f"{BASE_URL_V2}/inAppPurchases/{iap_id}/pricePoints"
+        f"?include=territory&filter[territory]={country_code}&limit=1000"
+    )
+    return _closest_price_point_for_token(token, url, country_code, float(target_price), expected_currency)
+
+
+def _closest_price_point_for_token(token: str, url: str, country_code: str, target_price: float, expected_currency: "str | None") -> tuple:
+    headers = {"Authorization": f"Bearer {token}"}
     resp = _get_with_rate_limit(url, headers)
 
     if resp.status_code != 200:
@@ -221,24 +265,24 @@ def get_closest_price_point(token, subscription_id, country_code, target_price, 
     return closest_point, actual_currency, None
 
 
-def resolve_price_point(
-    token, subscription_id, country, country_code, price, currency_code, country_prices_usd,
-    usd_rates: "dict | None" = None, rounding: str = "psychological",
+def _resolve_point(
+    get_point_fn, token, entity_id, country, country_code, price, currency_code, country_prices_usd,
+    usd_rates: "dict | None", rounding: str,
 ):
-    """Find the best price point, retrying in whatever currency Apple actually uses for
-    this territory when it differs from ours. Apple doesn't always fall back to USD - it
-    also prices several territories in EUR (observed: Serbia, Bosnia, Bulgaria) - so this
-    converts our USD-equivalent price into *whichever* currency Apple reports via
-    convert_to_currency() (the same conversion google.py uses for currency-locked Google
-    regions), rather than only ever retrying in USD and giving up on anything else.
+    """Shared by resolve_price_point (subscriptions) and resolve_iap_price_point (one-time
+    in-app purchases): find the best price point, retrying in whatever currency Apple
+    actually uses for this territory when it differs from ours. Apple doesn't always fall
+    back to USD - it also prices several territories in EUR (observed: Serbia, Bosnia,
+    Bulgaria) - so this converts our USD-equivalent price into *whichever* currency Apple
+    reports via convert_to_currency() (the same conversion google.py uses for
+    currency-locked Google regions), rather than only ever retrying in USD and giving up on
+    anything else.
 
     Returns (closest_point, final_price, final_currency, apple_territory_currency,
     api_error) - see get_closest_price_point() for why the transport-level error is carried
     separately from "no match found".
     """
-    closest_point, apple_currency, api_error = get_closest_price_point(
-        token, subscription_id, country_code, float(price), currency_code
-    )
+    closest_point, apple_currency, api_error = get_point_fn(token, entity_id, country_code, float(price), currency_code)
     if api_error:
         return None, price, currency_code, apple_currency, api_error
 
@@ -247,9 +291,7 @@ def resolve_price_point(
         converted_price = convert_to_currency(usd_price, apple_currency, usd_rates or {}, rounding)
         if converted_price is not None:
             print(f"   Apple uses {apple_currency} for {country_code}, retrying with {converted_price:.2f} {apple_currency}")
-            closest_point, _, api_error = get_closest_price_point(
-                token, subscription_id, country_code, converted_price, apple_currency
-            )
+            closest_point, _, api_error = get_point_fn(token, entity_id, country_code, converted_price, apple_currency)
             if api_error:
                 return None, converted_price, apple_currency, apple_currency, api_error
             if closest_point is not None:
@@ -258,6 +300,28 @@ def resolve_price_point(
             print(f"   Apple uses {apple_currency} for {country_code} (we have {currency_code}) — no rate available, skipping")
 
     return closest_point, price, currency_code, apple_currency, None
+
+
+def resolve_price_point(
+    token, subscription_id, country, country_code, price, currency_code, country_prices_usd,
+    usd_rates: "dict | None" = None, rounding: str = "psychological",
+):
+    return _resolve_point(
+        get_closest_price_point, token, subscription_id, country, country_code, price, currency_code,
+        country_prices_usd, usd_rates, rounding,
+    )
+
+
+def resolve_iap_price_point(
+    token, iap_id, country, country_code, price, currency_code, country_prices_usd,
+    usd_rates: "dict | None" = None, rounding: str = "psychological",
+):
+    """In-app purchase equivalent of resolve_price_point() - same retry-in-Apple's-currency
+    logic, against get_closest_iap_price_point()."""
+    return _resolve_point(
+        get_closest_iap_price_point, token, iap_id, country, country_code, price, currency_code,
+        country_prices_usd, usd_rates, rounding,
+    )
 
 
 def _build_price_payload(subscription_id: str, price_point_id: str, start_date: "str | None") -> dict:
@@ -448,4 +512,227 @@ def fetch_live_prices(creds: AppleCreds, data: InputData, config: "PricingConfig
         for country, entry in executor.map(_fetch_one, data.country_prices):
             if entry is not None:
                 live[country] = entry
+    return live
+
+
+# --- ONE-TIME IN-APP PURCHASES ---
+#
+# See the module docstring for why this section can't mirror update_prices()'s per-country
+# submission model: Apple has no per-territory PATCH for a one-time IAP's prices, only a
+# single POST that replaces the whole price schedule at once.
+
+def _make_iap_failure(country, country_code, price, currency, reason) -> dict:
+    # A distinct platform label from _make_failure()'s "Apple App Store" - otherwise a run
+    # that applies both the subscription and the one-time purchase in the same invocation
+    # merges their failures into one indistinguishable "Apple App Store" bucket in the
+    # failure report and the console summary table (report.write_failure_report() and
+    # ui.failure_summary_table() both group by this exact string).
+    return make_failure("Apple App Store (One-time)", country, country_code, price, currency, reason)
+
+
+def _build_iap_price_schedule_payload(iap_id: str, base_territory: str, resolved: "list[tuple[str, str, str]]") -> dict:
+    """Build the POST /v1/inAppPurchasePriceSchedules body. `resolved` is a list of
+    (country, territory_code, price_point_id) for every territory to include - the id
+    wrapping ("${territory_code}") mirrors offers.py's subscriptionPromotionalOfferPrices
+    payload, which Apple's own error responses dictated (a plain id is rejected with
+    ENTITY_ERROR.INCLUDED.INVALID_ID); territory_code is unique per territory so it doubles
+    as the local id linking each relationship entry to its "included" definition."""
+    manual_prices, included = [], []
+    for _, territory_code, price_point_id in resolved:
+        local_id = f"${{{territory_code}}}"
+        manual_prices.append({"type": "inAppPurchasePrices", "id": local_id})
+        included.append({
+            "type": "inAppPurchasePrices",
+            "id": local_id,
+            "attributes": {"startDate": None},
+            "relationships": {
+                "inAppPurchaseV2": {"data": {"type": "inAppPurchases", "id": iap_id}},
+                "inAppPurchasePricePoint": {"data": {"type": "inAppPurchasePricePoints", "id": price_point_id}},
+            },
+        })
+
+    return {
+        "data": {
+            "type": "inAppPurchasePriceSchedules",
+            "relationships": {
+                "inAppPurchase": {"data": {"type": "inAppPurchases", "id": iap_id}},
+                "baseTerritory": {"data": {"type": "territories", "id": base_territory}},
+                "manualPrices": {"data": manual_prices},
+            },
+        },
+        "included": included,
+    }
+
+
+def _resolve_iap_country(token, iap_id, country, price, data: InputData, config: PricingConfig, usd_rates) -> tuple:
+    """Resolve one country's price to an Apple price point. Returns
+    (country, territory_code, price_point_id, currency_code, failure) - price_point_id is
+    None when resolution failed, in which case `failure` carries the reason."""
+    try:
+        country_code = get_alpha_3_country_code(country, data.country_code_mapping)
+    except Exception as e:
+        reason = f"Error getting country code: {e}"
+        return country, None, None, None, _make_iap_failure(country, "Unknown", price, data.country_currencies.get(country, "Unknown"), reason)
+
+    currency_code = data.country_currencies.get(country)
+    if not currency_code:
+        return country, country_code, None, None, _make_iap_failure(country, country_code, price, "Unknown", "Error getting currency code")
+
+    closest_point, final_price, final_currency, apple_currency, api_error = resolve_iap_price_point(
+        token, iap_id, country, country_code, price, currency_code, data.country_prices_usd,
+        usd_rates=usd_rates, rounding=config.rounding,
+    )
+
+    if api_error:
+        return country, country_code, None, currency_code, _make_iap_failure(country, country_code, price, currency_code, api_error)
+
+    if not closest_point:
+        reason = (
+            f"No price points available with currency {currency_code}"
+            if not apple_currency
+            else f"No price points available (Apple uses {apple_currency}, we have {currency_code})"
+        )
+        return country, country_code, None, currency_code, _make_iap_failure(country, country_code, price, currency_code, reason)
+
+    closest_price = float(closest_point["attributes"]["customerPrice"])
+    price_difference = abs(closest_price - float(final_price))
+    tolerance = max(float(final_price) * config.apple_tolerance_pct, config.apple_tolerance_units)
+
+    if price_difference > tolerance:
+        reason = f"Price difference too large: {price_difference:.2f} (max allowed: {tolerance:.2f})"
+        return country, country_code, None, currency_code, _make_iap_failure(country, country_code, price, currency_code, reason)
+
+    return country, country_code, closest_point["id"], currency_code, None
+
+
+def update_iap_prices(creds: AppleOneTimeCreds, config: PricingConfig, data: InputData, dry_run: bool = False) -> list[dict]:
+    token = get_jwt(creds)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    iap_id = get_iap_id(token, creds)
+    if not iap_id:
+        reason = f"Could not find in-app purchase for app {creds.app_id} - check APPLE_IAP_PRODUCT_ID"
+        print(reason)
+        return [_make_iap_failure("N/A", "N/A", None, None, reason)]
+
+    # A price schedule's baseTerritory is required by Apple and has no independent meaning
+    # here beyond "which territory anchors this schedule" - config.anchor_country already
+    # plays that role for PPP scaling, so it's the natural choice.
+    base_territory = get_alpha_3_country_code(config.anchor_country, data.country_code_mapping)
+    if not base_territory:
+        reason = f"Could not resolve a territory code for anchor country '{config.anchor_country}' - check country_codes.json"
+        print(reason)
+        return [_make_iap_failure("N/A", "N/A", None, None, reason)]
+
+    print(f"{'[dry-run] Resolving' if dry_run else 'Updating'} in-app purchase prices for {len(data.country_prices)} countries...")
+
+    try:
+        usd_rates = fetch_all_usd_rates()
+    except Exception as e:
+        print(f"Warning: could not fetch exchange rates ({e}) - territories Apple prices in a different currency than ours won't be retried")
+        usd_rates = {}
+
+    resolved: list = []  # (country, territory_code, price_point_id, currency_code)
+    failures: list = []
+    with ThreadPoolExecutor(max_workers=config.apple_max_workers) as executor:
+        results = executor.map(
+            lambda item: _resolve_iap_country(token, iap_id, item[0], item[1], data, config, usd_rates),
+            data.country_prices.items(),
+        )
+        for country, territory_code, price_point_id, currency_code, failure in results:
+            if price_point_id:
+                resolved.append((country, territory_code, price_point_id, currency_code))
+            elif failure:
+                failures.append(failure)
+
+    if not resolved:
+        print("No territories resolved to a price point - not submitting a price schedule")
+        return failures
+
+    if dry_run:
+        print(f"[dry-run] Would submit one price schedule covering {len(resolved)} territories (base territory {base_territory}) - no request sent")
+        return failures
+
+    payload = _build_iap_price_schedule_payload(iap_id, base_territory, [(c, tc, pid) for c, tc, pid, _ in resolved])
+    resp = _post_with_rate_limit(f"{BASE_URL}/inAppPurchasePriceSchedules", headers, payload)
+    if resp.status_code == 201:
+        print(f"In-app purchase: submitted one price schedule covering {len(resolved)} territories, {len(failures)} could not be resolved")
+        return failures
+
+    # Unlike subscriptionPrices (one POST per territory), a one-time IAP's whole price
+    # schedule is replaced by a single POST - a rejection here means none of the batched
+    # territories were actually updated, not just the one that triggered the error, so
+    # every one of them gets its own failure record rather than a single aggregate error.
+    reason = f"API Error {resp.status_code}: {resp.text}"
+    print(f"Failed to submit price schedule covering {len(resolved)} territories: {reason}")
+    failures += [
+        _make_iap_failure(country, territory_code, data.country_prices.get(country), currency_code, reason)
+        for country, territory_code, _, currency_code in resolved
+    ]
+    return failures
+
+
+def fetch_live_iap_prices(creds: AppleOneTimeCreds, data: InputData, config: "PricingConfig | None" = None) -> dict[str, dict]:
+    """Return {country: {"price": float, "currency": str}} for each territory's current
+    live in-app purchase price - used for the apply-time diff against what's about to be
+    pushed.
+
+    Unlike subscriptions (one .../prices GET per territory), a one-time IAP's live prices
+    all live on its single price schedule: fetched once via iapPriceSchedule, then its
+    manualPrices relationship pages through every territory's current price - no
+    ThreadPoolExecutor needed here, this is a handful of paginated requests total rather
+    than one per country.
+    """
+    token = get_jwt(creds)
+    headers = {"Authorization": f"Bearer {token}"}
+    iap_id = get_iap_id(token, creds)
+    if not iap_id:
+        return {}
+
+    resp = _get_with_rate_limit(f"{BASE_URL_V2}/inAppPurchases/{iap_id}/iapPriceSchedule", headers)
+    if resp.status_code != 200:
+        # A brand-new in-app purchase with no price schedule yet reads as "not found" here -
+        # same as fetch_live_prices() returning {} when the subscription itself isn't found.
+        return {}
+    schedule_id = resp.json().get("data", {}).get("id")
+    if not schedule_id:
+        return {}
+
+    territory_to_country = {}
+    for country in data.country_prices:
+        code = get_alpha_3_country_code(country, data.country_code_mapping)
+        if code:
+            territory_to_country[code] = country
+
+    live = {}
+    url = (
+        f"{BASE_URL}/inAppPurchasePriceSchedules/{schedule_id}/manualPrices"
+        f"?include=inAppPurchasePricePoint,territory&limit=200"
+    )
+    while url:
+        resp = _get_with_rate_limit(url, headers)
+        if resp.status_code != 200:
+            break
+        body = resp.json()
+        included = body.get("included", [])
+        price_points = {i["id"]: i for i in included if i.get("type") == "inAppPurchasePricePoints"}
+        territories = {i["id"]: i for i in included if i.get("type") == "territories"}
+
+        for price in body.get("data", []):
+            point_ref = price.get("relationships", {}).get("inAppPurchasePricePoint", {}).get("data")
+            territory_ref = price.get("relationships", {}).get("territory", {}).get("data")
+            if not point_ref or not territory_ref:
+                continue
+            point = price_points.get(point_ref["id"])
+            territory = territories.get(territory_ref["id"])
+            country_name = territory_to_country.get(territory_ref["id"])
+            if not point or not country_name:
+                continue
+            live[country_name] = {
+                "price": float(point["attributes"]["customerPrice"]),
+                "currency": territory["attributes"]["currency"] if territory else None,
+            }
+
+        url = body.get("links", {}).get("next")
+
     return live
