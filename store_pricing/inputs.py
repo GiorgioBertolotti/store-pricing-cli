@@ -19,6 +19,9 @@ class InputData:
     country_prices_usd: dict
     country_currencies: dict
     country_code_mapping: dict
+    # The rounding the prices were scaled with, so a currency conversion at apply time rounds
+    # the same way. None for spreadsheets written before the column existed.
+    rounding: "str | None" = None
 
 
 def load_input_data(
@@ -45,6 +48,7 @@ def load_input_data(
         country_prices_usd=dict(zip(prices_df["Country"], prices_df["Smart_Price_USD"])),
         country_currencies=dict(zip(prices_df["Country"], prices_df["Currency_Code"])),
         country_code_mapping=country_code_mapping,
+        rounding=prices_df["Rounding"].iloc[0] if "Rounding" in prices_df.columns and len(prices_df) else None,
     )
 
 

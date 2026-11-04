@@ -339,7 +339,7 @@ def _resolve_offer_prices(
         country, country_code, currency_code, target_price = item
         closest_point, _, _, apple_currency, api_error = resolve_price_point(
             token, subscription_id, country, country_code, target_price, currency_code, discounted_usd_prices,
-            usd_rates=usd_rates, rounding=pricing.rounding,
+            usd_rates=usd_rates, rounding=data.rounding or pricing.rounding,
         )
         return country, country_code, currency_code, target_price, closest_point, apple_currency, api_error
 

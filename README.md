@@ -184,7 +184,9 @@ final_price    = smart_round(scaled_native)   # → .99 endings
 - VAT/GST rates are embedded for ~50 countries; unlisted countries default to 15% (both overridable)
 - Smart rounding snaps prices to platform-native tiers (e.g. `$9.99`, `$4.99`)
 
-**Market ratios (optional)**: PPP is a poor fit where people pay close to US prices for subscriptions despite lower purchasing power (Southern Europe, Japan). List per-plan ratios in `pricing.toml` (`[pricing.market_ratio.annual]`, `Italy = 1.05`) and run `pricing.py scale --plan annual`: listed countries are priced at that ratio of the anchor's tax-inclusive price, everyone else stays on PPP.
+**Market ratios (optional)**: PPP is a poor fit where people pay close to US prices for subscriptions despite lower purchasing power (Southern Europe, Japan). List per-plan ratios in `pricing.toml` (`[pricing.market_ratio.annual]`, `Italy = 1.05`) and run `pricing.py scale --plan annual`: listed countries are priced at that ratio of the anchor's tax-inclusive price, everyone else stays on PPP. `market_ratio_cap = 1.25` under `[pricing]` keeps any market-priced country at or below 125% of the anchor's price.
+
+**Per-plan rounding (optional)**: on a cheap plan a whole-unit `.99` step is a large share of the price. `[pricing.plan_rounding]` with `monthly = "psychological-half"` lets that plan end in `.49` as well as `.99`.
 
 **Apple price matching**: the App Store enforces a fixed set of price points per territory. The script finds the closest available point and skips the update if the difference exceeds a configurable tolerance (default 10% or 2 units of local currency). Skipped territories appear in the failure report.
 

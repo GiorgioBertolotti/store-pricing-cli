@@ -72,7 +72,8 @@ anchor_country = "United States"
 scaling_cap = 1.0
 # VAT/GST rate applied to countries not listed in [pricing.vat] below.
 default_vat = 0.15
-# "psychological" (round to .99-style endings) or "none" (raw computed price).
+# "psychological" (round to .99-style endings), "psychological-half" (.49 or .99) or
+# "none" (raw computed price).
 rounding = "psychological"
 
 [pricing.vat]
@@ -86,6 +87,14 @@ rounding = "psychological"
 # [pricing.market_ratio.annual]
 # Italy = 1.05
 # Japan = 0.95
+# Optional ceiling on any market ratio, e.g. 1.25 = never more than 125% of the anchor's
+# tax-inclusive price (set under [pricing], above the tables):
+# market_ratio_cap = 1.25
+
+# Rounding override per plan (`--plan`), e.g. .49/.99 endings for a cheap monthly plan
+# where a whole-unit step is a large share of the price:
+# [pricing.plan_rounding]
+# monthly = "psychological-half"
 
 [apple]
 # get_closest_price_point() skips a territory if the nearest available price point
@@ -175,6 +184,11 @@ class PricingConfig:
     apple_max_workers: int = 8
     ppp_year: str = "auto"
     market_ratios: dict = field(default_factory=dict)
+    plan_rounding: dict = field(default_factory=dict)
+    market_ratio_cap: "float | None" = None
+
+    def rounding_for(self, plan: "str | None") -> str:
+        return self.plan_rounding.get(plan, self.rounding) if plan else self.rounding
 
     def vat_rate(self, country: str) -> float:
         if country in self.vat_overrides:
@@ -184,7 +198,10 @@ class PricingConfig:
     def market_ratio(self, plan: "str | None", country: str) -> "float | None":
         if plan is None:
             return None
-        return self.market_ratios.get(plan, {}).get(country)
+        ratio = self.market_ratios.get(plan, {}).get(country)
+        if ratio is None or self.market_ratio_cap is None:
+            return ratio
+        return min(ratio, self.market_ratio_cap)
 
 
 @dataclass
@@ -400,7 +417,7 @@ def _load_toml(path: Path) -> dict:
         return tomllib.load(f)
 
 
-ROUNDING_MODES = ("psychological", "none")
+ROUNDING_MODES = ("psychological", "psychological-half", "none")
 PLANS = ("weekly", "monthly", "annual")
 
 
@@ -455,6 +472,17 @@ def load_pricing_config(toml_path: Path = TOML_PATH) -> PricingConfig:
             for country, ratio in ratios.items()
         }
 
+    plan_rounding = {}
+    for plan, mode in pricing.get("plan_rounding", {}).items():
+        if plan not in PLANS:
+            raise ConfigError(f"pricing.toml: [pricing.plan_rounding] {plan} is not a plan, expected one of {', '.join(PLANS)}")
+        mode = str(mode).strip().lower()
+        if mode not in ROUNDING_MODES:
+            raise ConfigError(
+                f"pricing.toml: [pricing.plan_rounding] {plan} must be one of {', '.join(ROUNDING_MODES)}, got {mode!r}"
+            )
+        plan_rounding[plan] = mode
+
     return PricingConfig(
         anchor_country=pricing.get("anchor_country", "United States"),
         # A cap below 1.0 discounts everyone including the anchor; above 1.0 lets pricier
@@ -469,6 +497,11 @@ def load_pricing_config(toml_path: Path = TOML_PATH) -> PricingConfig:
         apple_max_workers=_number(apple, "max_workers", 8, "apple", minimum=1, cast=int),
         ppp_year=str(dataconf.get("ppp_year", "auto")),
         market_ratios=market_ratios,
+        plan_rounding=plan_rounding,
+        market_ratio_cap=(
+            _number(pricing, "market_ratio_cap", None, "pricing", minimum=1e-9)
+            if "market_ratio_cap" in pricing else None
+        ),
     )
 
 

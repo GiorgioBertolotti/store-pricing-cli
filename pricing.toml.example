@@ -11,7 +11,8 @@ anchor_country = "United States"
 scaling_cap = 1.0
 # VAT/GST rate applied to countries not listed in [pricing.vat] below.
 default_vat = 0.15
-# "psychological" (round to .99-style endings) or "none" (raw computed price).
+# "psychological" (round to .99-style endings), "psychological-half" (.49 or .99) or
+# "none" (raw computed price).
 rounding = "psychological"
 
 [pricing.vat]
@@ -25,6 +26,14 @@ rounding = "psychological"
 # [pricing.market_ratio.annual]
 # Italy = 1.05
 # Japan = 0.95
+# Optional ceiling on any market ratio, e.g. 1.25 = never more than 125% of the anchor's
+# tax-inclusive price (set under [pricing], above the tables):
+# market_ratio_cap = 1.25
+
+# Rounding override per plan (`--plan`), e.g. .49/.99 endings for a cheap monthly plan
+# where a whole-unit step is a large share of the price:
+# [pricing.plan_rounding]
+# monthly = "psychological-half"
 
 [apple]
 # get_closest_price_point() skips a territory if the nearest available price point

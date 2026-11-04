@@ -294,3 +294,36 @@ def test_non_positive_market_ratio_is_rejected_and_names_the_country(tmp_path):
     toml.write_text('[pricing.market_ratio.annual]\nItaly = 0\n')
     with pytest.raises(ConfigError, match="Italy"):
         load_pricing_config(toml)
+
+
+def test_plan_rounding_is_parsed_and_falls_back_to_the_default(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text('[pricing.plan_rounding]\nmonthly = "Psychological-Half"\n')
+    config = load_pricing_config(toml)
+    assert config.rounding_for("monthly") == "psychological-half"
+    assert config.rounding_for("annual") == "psychological"
+    assert config.rounding_for(None) == "psychological"
+
+
+def test_unknown_plan_rounding_mode_is_rejected(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text('[pricing.plan_rounding]\nmonthly = "half"\n')
+    with pytest.raises(ConfigError, match="monthly"):
+        load_pricing_config(toml)
+
+
+def test_market_ratio_cap_clamps_only_ratios_above_it(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text(
+        '[pricing]\nmarket_ratio_cap = 1.25\n\n'
+        '[pricing.market_ratio.monthly]\nNetherlands = 1.62\nItaly = 0.85\n'
+    )
+    config = load_pricing_config(toml)
+    assert config.market_ratio("monthly", "Netherlands") == 1.25
+    assert config.market_ratio("monthly", "Italy") == 0.85
+
+
+def test_market_ratio_cap_defaults_to_none(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text('[pricing.market_ratio.monthly]\nNetherlands = 1.62\n')
+    assert load_pricing_config(toml).market_ratio("monthly", "Netherlands") == 1.62

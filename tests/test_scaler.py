@@ -183,3 +183,32 @@ def test_vat_table_uses_world_bank_country_names():
     # Present in the VAT table but absent from the World Bank PPP dataset entirely.
     no_ppp_data = {"Argentina", "Liechtenstein", "Taiwan"}
     assert sorted(set(DEFAULT_VAT_RATES) - known - no_ppp_data) == []
+
+
+# --- psychological-half rounding ---
+
+@pytest.mark.parametrize("price,expected", [
+    (2.20, 1.99),
+    (2.30, 2.49),
+    (2.70, 2.49),
+    (2.80, 2.99),
+    (18.60, 18.49),
+    (0.50, 0.59),     # sub-unit tiers are unchanged
+    (247.0, 245),     # 100+ steps are unchanged
+])
+def test_half_rounding_picks_the_nearest_49_or_99_ending(price, expected):
+    assert apply_smart_pricing(price, rounding="psychological-half") == pytest.approx(expected)
+
+
+def test_plan_rounding_overrides_the_default_only_for_that_plan():
+    from store_pricing.scaler import scale_price
+
+    config = PricingConfig(plan_rounding={"monthly": "psychological-half"})
+    factors = {"United States": _factor(1.0, 1.0, "USD")}
+
+    monthly = scale_price(2.40, factors, config, plan="monthly").set_index("Country")
+    annual = scale_price(2.40, factors, config, plan="annual").set_index("Country")
+
+    assert monthly.loc["United States", "Smart_Price_Native"] == pytest.approx(2.49)
+    assert monthly.loc["United States", "Rounding"] == "psychological-half"
+    assert annual.loc["United States", "Smart_Price_Native"] == pytest.approx(1.99)

@@ -156,6 +156,8 @@ def apply_smart_pricing(price: float, rounding: str = "psychological") -> float:
 
     rounding="none" returns the price unrounded, for anyone who'd rather set exact
     values (e.g. testing, or a store that already enforces its own price tiers).
+    rounding="psychological-half" also allows .49 endings between 1 and 100, halving the
+    worst-case rounding error, which matters on cheap plans where a whole unit is 30%+.
     """
     if rounding == "none" or price <= 0:
         return price
@@ -169,6 +171,11 @@ def apply_smart_pricing(price: float, rounding: str = "psychological") -> float:
             if cents >= threshold:
                 return value
         return 0.09
+
+    if price < 100.0 and rounding == "psychological-half":
+        dollars = int(price)
+        candidates = (dollars - 0.01, dollars + 0.49, dollars + 0.99)
+        return round(min(candidates, key=lambda c: abs(c - price)), 2)
 
     # For prices $1-$100, use a .99 ending, rounding down under the half-dollar mark
     if price < 100.0:
@@ -209,6 +216,7 @@ def scale_price(
     includes local tax, so VAT is not added again.
     """
     anchor_gross_usd = usd_amount * (1 + config.vat_rate(config.anchor_country))
+    rounding = config.rounding_for(plan)
     results = []
     for country, factor_data in scaling_factors.items():
         exchange_rate = factor_data["exchange_rate"]
@@ -228,7 +236,7 @@ def scale_price(
             taxed_price_native = scaled_price_native * (1 + tax_rate)
             basis = "ppp"
 
-        smart_price_native = apply_smart_pricing(taxed_price_native, config.rounding)
+        smart_price_native = apply_smart_pricing(taxed_price_native, rounding)
         smart_price_usd = smart_price_native / exchange_rate
 
         results.append({
@@ -243,6 +251,7 @@ def scale_price(
             "Smart_Price_USD": smart_price_usd,
             "Scaling_Factor": scaling_factor,
             "Pricing_Basis": basis,
+            "Rounding": rounding,
             "Meal_Price_Native": factor_data["meal_price_native"],
             "Meal_Price_USD": factor_data["meal_price_usd"],
             "Exchange_Rate": exchange_rate,

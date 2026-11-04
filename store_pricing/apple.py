@@ -384,7 +384,7 @@ def _update_country(
 
     closest_point, final_price, final_currency, apple_currency, api_error = resolve_price_point(
         token, subscription_id, country, country_code, price, currency_code, data.country_prices_usd,
-        usd_rates=usd_rates, rounding=config.rounding,
+        usd_rates=usd_rates, rounding=data.rounding or config.rounding,
     )
 
     if api_error:
@@ -580,7 +580,7 @@ def _resolve_iap_country(token, iap_id, country, price, data: InputData, config:
 
     closest_point, final_price, final_currency, apple_currency, api_error = resolve_iap_price_point(
         token, iap_id, country, country_code, price, currency_code, data.country_prices_usd,
-        usd_rates=usd_rates, rounding=config.rounding,
+        usd_rates=usd_rates, rounding=data.rounding or config.rounding,
     )
 
     if api_error:

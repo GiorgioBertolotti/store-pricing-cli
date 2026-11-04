@@ -383,7 +383,7 @@ def update_prices(creds: GoogleCreds, config: PricingConfig, data: InputData, dr
             print(f"{'[dry-run] Would update' if dry_run else 'Updating'} Google Play price for {country} ({country_code}): {price} {currency_code}")
             failure = _update_region(
                 subscription_update, creds, country, country_code, currency_code, price,
-                usd_price=data.country_prices_usd.get(country), usd_rates=usd_rates, rounding=config.rounding,
+                usd_price=data.country_prices_usd.get(country), usd_rates=usd_rates, rounding=data.rounding or config.rounding,
             )
             if failure:
                 failures.append(failure)
@@ -692,7 +692,7 @@ def update_onetime_prices(creds: GoogleOneTimeCreds, config: PricingConfig, data
             print(f"{'[dry-run] Would update' if dry_run else 'Updating'} Google Play one-time price for {country} ({country_code}): {price} {currency_code}")
             failure = _update_onetime_region(
                 product_update, creds, country, country_code, currency_code, price,
-                usd_price=data.country_prices_usd.get(country), usd_rates=usd_rates, rounding=config.rounding,
+                usd_price=data.country_prices_usd.get(country), usd_rates=usd_rates, rounding=data.rounding or config.rounding,
             )
             if failure:
                 failures.append(failure)
