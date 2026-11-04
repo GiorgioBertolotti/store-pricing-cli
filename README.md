@@ -91,6 +91,8 @@ pricing.py scale          # compute prices -> price_scaled.xlsx only
 pricing.py apply          # push price_scaled.xlsx live
 pricing.py offer          # create a promotional/discount offer
 pricing.py refresh-data   # refresh the cost-of-living cache and country codes
+pricing.py backup-google  # snapshot the Google Play products (read-only)
+pricing.py restore-google --backup backups/<file>.json  # put a snapshot's prices back
 ```
 
 Every subcommand accepts flags for unattended/CI use and falls back to a prompt for anything you omit — `pricing.py apply --yes` skips confirmation, `pricing.py scale --price 9.99` skips the prompt.
@@ -135,7 +137,7 @@ python pricing.py apply --yes           # skip confirmation (CI)
 
 Reads `price_scaled.xlsx` and `country_codes.json`, fetches what's currently live on each targeted store, and shows a diff before pushing anything:
 
-- **Google Play**: fetches the subscription object, patches all regional configs in a single API call, auto-retries on recoverable 400 errors (stale currency, non-billable region, price out of range)
+- **Google Play**: fetches the subscription object, saves a copy of it to `backups/`, patches all regional configs in a single API call, auto-retries on recoverable 400 errors (stale currency, non-billable region, price out of range), then re-reads it and flags any price that changed outside the base plan being priced. `pricing.py restore-google --backup <file>` puts a saved copy back (`--dry-run` lists what would change first)
 - **App Store Connect**: generates a JWT, resolves each territory to the closest available price point in parallel, and submits the price update
 
 `--dry-run` runs the full resolution path — auth, price-point matching, payload construction — and reports exactly what would happen without submitting anything, so it's safe to try against a live account. Any country that could not be updated (or would fail under `--dry-run`) is logged to a timestamped `price_update_failures_YYYYMMDD_HHMMSS.txt` report.

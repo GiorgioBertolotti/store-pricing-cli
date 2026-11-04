@@ -36,6 +36,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from store_pricing import backup
 from store_pricing.config import GoogleCreds, GoogleOneTimeCreds, PricingConfig
 from store_pricing.inputs import InputData, get_alpha_2_country_code
 from store_pricing.report import make_failure
@@ -398,12 +399,38 @@ def update_prices(creds: GoogleCreds, config: PricingConfig, data: InputData, dr
         print(f"[dry-run] Would patch base plan '{creds.baseplan_id}' - no request sent")
         return failures
 
+    try:
+        backup_path = backup.write_backup(backup.SUBSCRIPTION, creds.subscription_id, subscription_response)
+    except Exception as e:
+        return failures + [_make_failure(
+            "N/A", "N/A", None, None,
+            f"Could not back up the subscription before patching ({e}) - no prices were updated",
+        )]
+    print(f"Backed up subscription '{creds.subscription_id}' to {backup_path}")
+
     auto_fixed, patch_failures = patch_with_currency_fixes(service, creds, subscription_update, regions_version)
     if auto_fixed:
         failures = [f for f in failures if f.get("country_code") not in auto_fixed]
     failures.extend(patch_failures)
     print("Successfully updated Google Play prices")
+
+    after = fetch_subscription(service, creds)
+    failures.extend(_verification_failures(
+        _make_failure, subscription_response, after[0] if after else None,
+        backup.SUBSCRIPTION, creds.baseplan_id, backup_path,
+    ))
     return failures
+
+
+def _verification_failures(make, before: dict, after: "dict | None", shape, target_id: str, backup_path) -> list[dict]:
+    """Re-read after the patch and report anything outside the priced container that moved."""
+    restore_hint = f"restore with `pricing.py restore-google --backup {backup_path}`"
+    if after is None:
+        return [make("N/A", "N/A", None, None, f"Could not re-read the product to verify the patch - {restore_hint} if needed")]
+    issues = backup.compare(before, after, shape, target_id)
+    if issues:
+        print(f"WARNING: the patch changed prices outside '{target_id}' - {restore_hint}")
+    return [make("N/A", "N/A", None, None, f"Unexpected change after patch: {issue} - {restore_hint}") for issue in issues]
 
 
 # --- ONE-TIME (MANAGED) PRODUCTS ---
@@ -707,9 +734,93 @@ def update_onetime_prices(creds: GoogleOneTimeCreds, config: PricingConfig, data
         print(f"[dry-run] Would patch purchase option '{creds.purchase_option_id}' - no request sent")
         return failures
 
+    try:
+        backup_path = backup.write_backup(backup.ONETIME_PRODUCT, creds.product_id, product_response)
+    except Exception as e:
+        return failures + [_make_onetime_failure(
+            "N/A", "N/A", None, None,
+            f"Could not back up the one-time product before patching ({e}) - no prices were updated",
+        )]
+    print(f"Backed up one-time product '{creds.product_id}' to {backup_path}")
+
     auto_fixed, patch_failures = patch_onetime_with_currency_fixes(service, creds, product_update, regions_version)
     if auto_fixed:
         failures = [f for f in failures if f.get("country_code") not in auto_fixed]
     failures.extend(patch_failures)
     print("Successfully updated Google Play one-time product prices")
+
+    after = fetch_onetime_product(service, creds)
+    failures.extend(_verification_failures(
+        _make_onetime_failure, product_response, after[0] if after else None,
+        backup.ONETIME_PRODUCT, creds.purchase_option_id, backup_path,
+    ))
     return failures
+
+
+# --- RESTORE FROM BACKUP ---
+
+def backup_live(creds: "GoogleCreds | GoogleOneTimeCreds"):
+    """Snapshot the live product without changing anything. Returns the backup path."""
+    is_subscription = isinstance(creds, GoogleCreds)
+    shape = backup.SUBSCRIPTION if is_subscription else backup.ONETIME_PRODUCT
+    service = build_service(creds)
+    result = (fetch_subscription if is_subscription else fetch_onetime_product)(service, creds)
+    if result is None:
+        raise RuntimeError("Could not fetch the live product from Google Play")
+    return backup.write_backup(shape, creds.subscription_id if is_subscription else creds.product_id, result[0])
+
+
+def _patch_resource(service, shape, creds, body: dict, regions_version: str) -> None:
+    if shape is backup.SUBSCRIPTION:
+        request = service.monetization().subscriptions().patch(
+            packageName=creds.package_name, productId=creds.subscription_id,
+            allowMissing=False, updateMask="basePlans", body=body,
+        )
+    else:
+        request = service.monetization().onetimeproducts().patch(
+            packageName=creds.package_name, productId=creds.product_id,
+            allowMissing=False, updateMask="purchaseOptions", body=body,
+        )
+    sep = "&" if "?" in request.uri else "?"
+    request.uri += f"{sep}regionsVersion.version={regions_version}"
+    request.execute()
+
+
+def restore_from_backup(
+    creds: "GoogleCreds | GoogleOneTimeCreds", payload: dict, dry_run: bool = False
+) -> tuple[list[str], list[str]]:
+    """Put a backup's regional prices back. Returns (changes, remaining): what the restore
+    changes relative to what is live now, and what still differs from the backup afterwards
+    (empty on success). Snapshots the live state first, so a restore can itself be undone.
+    No 400-error recovery here: a restore must land exactly as backed up or not at all."""
+    shape = backup.SHAPES[payload["kind"]]
+    live_product_id = creds.subscription_id if shape is backup.SUBSCRIPTION else creds.product_id
+    if payload["product_id"] != live_product_id:
+        raise ValueError(
+            f"Backup is for '{payload['product_id']}' but the configured product is '{live_product_id}' - "
+            "point .env at the product the backup was taken from"
+        )
+
+    service = build_service(creds)
+    fetch = fetch_subscription if shape is backup.SUBSCRIPTION else fetch_onetime_product
+    result = fetch(service, creds)
+    if result is None:
+        raise RuntimeError("Could not fetch the live product from Google Play")
+    live, regions_version = result
+    wanted = payload["resource"]
+
+    changes = backup.compare(live, wanted, shape, None)
+    if dry_run or not changes:
+        return changes, []
+
+    snapshot = backup.write_backup(shape, live_product_id, live)
+    print(f"Backed up the current state to {snapshot} before restoring")
+
+    body = copy.deepcopy(live)
+    body[shape.containers_key] = copy.deepcopy(wanted.get(shape.containers_key, []))
+    _patch_resource(service, shape, creds, body, regions_version)
+
+    after = fetch(service, creds)
+    if after is None:
+        return changes, ["Could not re-read the product to verify the restore"]
+    return changes, backup.compare(wanted, after[0], shape, None)

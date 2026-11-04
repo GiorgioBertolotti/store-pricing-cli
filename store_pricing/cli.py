@@ -111,6 +111,15 @@ def build_parser() -> argparse.ArgumentParser:
     # only exists for the *automatic* refresh in ensure_data_fresh().
     sub.add_parser("refresh-data", help="Refresh cost_of_living_data.xlsx and country_codes.json")
 
+    sub.add_parser("backup-google", help="Snapshot the configured Google Play products to backups/ (read-only)")
+
+    p_restore = sub.add_parser(
+        "restore-google", help="Put back the Google Play prices from a backup taken by `apply` (backups/*.json)",
+    )
+    p_restore.add_argument("--backup", required=True, help="Path to the backup JSON")
+    p_restore.add_argument("--dry-run", action="store_true", help="List what would change, push nothing")
+    p_restore.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+
     return parser
 
 
@@ -532,6 +541,63 @@ def cmd_offer(args) -> int:
     return _report(failures, dry_run=args.dry_run)
 
 
+def cmd_backup_google() -> int:
+    settings = load_settings()
+    targets = [c for c in (settings.google, settings.google_onetime) if c is not None]
+    if not targets:
+        console.print("[red]Google Play isn't configured. Run `pricing.py setup --google`.[/red]")
+        return 1
+    for creds in targets:
+        try:
+            console.print(f"Saved {google_api.backup_live(creds)}")
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            return 1
+    return 0
+
+
+def cmd_restore_google(args) -> int:
+    from store_pricing import backup
+
+    settings = load_settings()
+    try:
+        payload = backup.load_backup(Path(args.backup))
+    except (OSError, ValueError) as e:
+        console.print(f"[red]Can't read the backup: {e}[/red]")
+        return 1
+
+    creds = settings.google if payload["kind"] == backup.SUBSCRIPTION.kind else settings.google_onetime
+    if creds is None:
+        console.print("[red]Google Play isn't configured for this product type. Run `pricing.py setup --google`.[/red]")
+        return 1
+
+    try:
+        changes, _ = google_api.restore_from_backup(creds, payload, dry_run=True)
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]{e}[/red]")
+        return 1
+
+    if not changes:
+        console.print(f"Live prices already match the backup taken at {payload['taken_at']} - nothing to restore.")
+        return 0
+    console.print(f"Restoring the backup taken at {payload['taken_at']} would change {len(changes)} price(s):")
+    for change in changes:
+        console.print(f"  {change}")
+    if args.dry_run:
+        return 0
+    if not args.yes and not confirm("Push the backup's prices live?", default=False):
+        return 0
+
+    _, remaining = google_api.restore_from_backup(creds, payload)
+    if remaining:
+        console.print("[red]The restore went through but these still differ from the backup:[/red]")
+        for item in remaining:
+            console.print(f"  {item}")
+        return 1
+    console.print("[green]Restored - live prices match the backup.[/green]")
+    return 0
+
+
 def main(argv: "list[str] | None" = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -557,6 +623,10 @@ def main(argv: "list[str] | None" = None) -> int:
         return cmd_apply(args)
     if args.command == "offer":
         return cmd_offer(args)
+    if args.command == "backup-google":
+        return cmd_backup_google()
+    if args.command == "restore-google":
+        return cmd_restore_google(args)
     if args.command == "refresh-data":
         # Asking for the refresh explicitly always refreshes; the
         # staleness gate only applies to the automatic refresh in ensure_data_fresh().
