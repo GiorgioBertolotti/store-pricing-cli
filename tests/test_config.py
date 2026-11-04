@@ -270,3 +270,27 @@ def test_valid_overrides_are_parsed(tmp_path):
     assert config.vat_rate("Japan") == 0.10
     assert config.apple_max_workers == 4
     assert config.ppp_year == "2024"
+
+
+def test_market_ratios_are_parsed_per_plan(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text('[pricing.market_ratio.annual]\nItaly = 1.05\n\n[pricing.market_ratio.monthly]\nItaly = 0.85\n')
+    config = load_pricing_config(toml)
+    assert config.market_ratio("annual", "Italy") == 1.05
+    assert config.market_ratio("monthly", "Italy") == 0.85
+    assert config.market_ratio("weekly", "Italy") is None
+    assert config.market_ratio(None, "Italy") is None
+
+
+def test_unknown_market_ratio_plan_is_rejected(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text('[pricing.market_ratio.yearly]\nItaly = 1.05\n')
+    with pytest.raises(ConfigError, match="market_ratio.yearly"):
+        load_pricing_config(toml)
+
+
+def test_non_positive_market_ratio_is_rejected_and_names_the_country(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text('[pricing.market_ratio.annual]\nItaly = 0\n')
+    with pytest.raises(ConfigError, match="Italy"):
+        load_pricing_config(toml)

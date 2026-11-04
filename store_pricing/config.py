@@ -25,37 +25,39 @@ from dotenv import dotenv_values
 ENV_PATH = Path(".env")
 TOML_PATH = Path("pricing.toml")
 
-# Built-in VAT/GST rates by country (as of 2024), overridable per-country via
+# Built-in VAT/GST rates by country (as of 2025), overridable per-country via
 # pricing.toml's [pricing.vat] table. Countries not listed fall back to `default_vat`.
+# Keys must be the World Bank country names used in cost_of_living_data.xlsx ("Czechia",
+# "Turkiye", "Korea, Rep."): any other spelling silently falls back to `default_vat`.
 DEFAULT_VAT_RATES: dict[str, float] = {
     # European Union countries (VAT)
     "Austria": 0.20, "Belgium": 0.21, "Bulgaria": 0.20, "Croatia": 0.25,
-    "Cyprus": 0.19, "Czech Republic": 0.21, "Denmark": 0.25, "Estonia": 0.20,
-    "Finland": 0.24, "France": 0.20, "Germany": 0.19, "Greece": 0.24,
+    "Cyprus": 0.19, "Czechia": 0.21, "Denmark": 0.25, "Estonia": 0.24,
+    "Finland": 0.255, "France": 0.20, "Germany": 0.19, "Greece": 0.24,
     "Hungary": 0.27, "Ireland": 0.23, "Italy": 0.22, "Latvia": 0.21,
     "Lithuania": 0.21, "Luxembourg": 0.17, "Malta": 0.18, "Netherlands": 0.21,
-    "Poland": 0.23, "Portugal": 0.23, "Romania": 0.19, "Slovakia": 0.20,
+    "Poland": 0.23, "Portugal": 0.23, "Romania": 0.21, "Slovak Republic": 0.23,
     "Slovenia": 0.22, "Spain": 0.21, "Sweden": 0.25,
     # Other European countries
-    "United Kingdom": 0.20, "Switzerland": 0.077, "Norway": 0.25,
-    "Iceland": 0.24, "Liechtenstein": 0.077,
+    "United Kingdom": 0.20, "Switzerland": 0.081, "Norway": 0.25,
+    "Iceland": 0.24, "Liechtenstein": 0.081,
     # North America
     "United States": 0.0, "Canada": 0.05, "Mexico": 0.16,
     # Asia-Pacific
-    "Australia": 0.10, "New Zealand": 0.15, "Japan": 0.10, "South Korea": 0.10,
-    "Singapore": 0.07, "Hong Kong": 0.0, "Taiwan": 0.05, "Thailand": 0.07,
-    "Malaysia": 0.06, "Indonesia": 0.11, "Philippines": 0.12, "Vietnam": 0.10,
+    "Australia": 0.10, "New Zealand": 0.15, "Japan": 0.10, "Korea, Rep.": 0.10,
+    "Singapore": 0.07, "Hong Kong SAR, China": 0.0, "Taiwan": 0.05, "Thailand": 0.07,
+    "Malaysia": 0.06, "Indonesia": 0.11, "Philippines": 0.12, "Viet Nam": 0.10,
     "India": 0.18, "China": 0.13, "Pakistan": 0.17,
     # Middle East & Africa
     "United Arab Emirates": 0.05, "Saudi Arabia": 0.15, "Qatar": 0.0,
     "Kuwait": 0.0, "Bahrain": 0.10, "Oman": 0.05, "Israel": 0.17,
-    "Turkey": 0.20, "Egypt": 0.14, "South Africa": 0.15, "Nigeria": 0.075,
+    "Turkiye": 0.20, "Egypt, Arab Rep.": 0.14, "South Africa": 0.15, "Nigeria": 0.075,
     "Kenya": 0.16,
     # South America
     "Brazil": 0.17, "Argentina": 0.21, "Chile": 0.19, "Colombia": 0.19,
     "Peru": 0.18, "Uruguay": 0.22,
     # Other major countries
-    "Russia": 0.20, "Ukraine": 0.20, "Belarus": 0.20, "Kazakhstan": 0.12,
+    "Russian Federation": 0.20, "Ukraine": 0.20, "Belarus": 0.20, "Kazakhstan": 0.12,
     "Uzbekistan": 0.12,
 }
 
@@ -76,6 +78,14 @@ rounding = "psychological"
 [pricing.vat]
 # Per-country overrides of the built-in VAT/GST table, e.g.:
 # Germany = 0.19
+
+# Market price ratios per plan (`--plan weekly|monthly|annual`): what users in a country
+# actually pay for that plan length, tax included, relative to the anchor country's price.
+# A country listed here skips PPP scaling and VAT is not added on top (the ratio already
+# includes it); everyone else falls back to PPP. Names are World Bank country names. E.g.:
+# [pricing.market_ratio.annual]
+# Italy = 1.05
+# Japan = 0.95
 
 [apple]
 # get_closest_price_point() skips a territory if the nearest available price point
@@ -164,11 +174,17 @@ class PricingConfig:
     apple_tolerance_units: float = 2.0
     apple_max_workers: int = 8
     ppp_year: str = "auto"
+    market_ratios: dict = field(default_factory=dict)
 
     def vat_rate(self, country: str) -> float:
         if country in self.vat_overrides:
             return self.vat_overrides[country]
         return DEFAULT_VAT_RATES.get(country, self.default_vat)
+
+    def market_ratio(self, plan: "str | None", country: str) -> "float | None":
+        if plan is None:
+            return None
+        return self.market_ratios.get(plan, {}).get(country)
 
 
 @dataclass
@@ -385,6 +401,7 @@ def _load_toml(path: Path) -> dict:
 
 
 ROUNDING_MODES = ("psychological", "none")
+PLANS = ("weekly", "monthly", "annual")
 
 
 class ConfigError(ValueError):
@@ -425,6 +442,19 @@ def load_pricing_config(toml_path: Path = TOML_PATH) -> PricingConfig:
         for country, rate in pricing.get("vat", {}).items()
     }
 
+    market_ratios = {}
+    for plan, ratios in pricing.get("market_ratio", {}).items():
+        if plan not in PLANS:
+            raise ConfigError(
+                f"pricing.toml: [pricing.market_ratio.{plan}] is not a plan, expected one of {', '.join(PLANS)}"
+            )
+        if not isinstance(ratios, dict):
+            raise ConfigError(f"pricing.toml: [pricing.market_ratio.{plan}] must be a table of country = ratio")
+        market_ratios[plan] = {
+            country: _check_number(ratio, country, f"pricing.market_ratio.{plan}", minimum=1e-9)
+            for country, ratio in ratios.items()
+        }
+
     return PricingConfig(
         anchor_country=pricing.get("anchor_country", "United States"),
         # A cap below 1.0 discounts everyone including the anchor; above 1.0 lets pricier
@@ -438,6 +468,7 @@ def load_pricing_config(toml_path: Path = TOML_PATH) -> PricingConfig:
         # 0 would raise inside ThreadPoolExecutor rather than here, mid-run.
         apple_max_workers=_number(apple, "max_workers", 8, "apple", minimum=1, cast=int),
         ppp_year=str(dataconf.get("ppp_year", "auto")),
+        market_ratios=market_ratios,
     )
 
 

@@ -199,18 +199,37 @@ def convert_to_currency(usd_price: "float | None", target_currency: str, usd_rat
     return apply_smart_pricing(usd_price * rate, rounding)
 
 
-def scale_price(usd_amount: float, scaling_factors: dict[str, dict], config: PricingConfig) -> pd.DataFrame:
-    """Scale a USD amount to every country's local, tax-inclusive, smart-rounded price."""
+def scale_price(
+    usd_amount: float, scaling_factors: dict[str, dict], config: PricingConfig, plan: "str | None" = None
+) -> pd.DataFrame:
+    """Scale a USD amount to every country's local, tax-inclusive, smart-rounded price.
+
+    With a `plan`, a country that has a `[pricing.market_ratio.<plan>]` entry is priced at
+    that ratio of the anchor's tax-inclusive price instead of by PPP; its ratio already
+    includes local tax, so VAT is not added again.
+    """
+    anchor_gross_usd = usd_amount * (1 + config.vat_rate(config.anchor_country))
     results = []
     for country, factor_data in scaling_factors.items():
-        scaled_price_usd = usd_amount * factor_data["scaling_factor"]
-        scaled_price_native = scaled_price_usd * factor_data["exchange_rate"]
-
+        exchange_rate = factor_data["exchange_rate"]
         tax_rate = config.vat_rate(country)
-        taxed_price_native = scaled_price_native * (1 + tax_rate)
+        market_ratio = config.market_ratio(plan, country)
+
+        if market_ratio is not None:
+            taxed_price_native = anchor_gross_usd * market_ratio * exchange_rate
+            scaled_price_native = taxed_price_native / (1 + tax_rate)
+            scaled_price_usd = scaled_price_native / exchange_rate
+            scaling_factor = scaled_price_usd / usd_amount
+            basis = "market"
+        else:
+            scaling_factor = factor_data["scaling_factor"]
+            scaled_price_usd = usd_amount * scaling_factor
+            scaled_price_native = scaled_price_usd * exchange_rate
+            taxed_price_native = scaled_price_native * (1 + tax_rate)
+            basis = "ppp"
 
         smart_price_native = apply_smart_pricing(taxed_price_native, config.rounding)
-        smart_price_usd = smart_price_native / factor_data["exchange_rate"]
+        smart_price_usd = smart_price_native / exchange_rate
 
         results.append({
             "Country": country,
@@ -222,14 +241,24 @@ def scale_price(usd_amount: float, scaling_factors: dict[str, dict], config: Pri
             "Tax_Rate": tax_rate,
             "Smart_Price_Native": smart_price_native,
             "Smart_Price_USD": smart_price_usd,
-            "Scaling_Factor": factor_data["scaling_factor"],
+            "Scaling_Factor": scaling_factor,
+            "Pricing_Basis": basis,
             "Meal_Price_Native": factor_data["meal_price_native"],
             "Meal_Price_USD": factor_data["meal_price_usd"],
-            "Exchange_Rate": factor_data["exchange_rate"],
+            "Exchange_Rate": exchange_rate,
             "Purchasing_Power_Ratio": factor_data["purchasing_power_ratio"],
         })
 
     return pd.DataFrame(results).sort_values("Scaled_Price_USD", ascending=False)
+
+
+def unknown_market_ratio_countries(config: PricingConfig, plan: "str | None", known: "set[str] | list[str]") -> list[str]:
+    """Countries listed under the plan's market ratios that the cost-of-living data doesn't
+    know, almost always a non-World-Bank spelling (e.g. "Turkey" for "Turkiye")."""
+    if plan is None:
+        return []
+    known = set(known)
+    return sorted(c for c in config.market_ratios.get(plan, {}) if c not in known)
 
 
 def save_results(df: pd.DataFrame, path: Path = SCALED_PRICES_FILE) -> Path:
@@ -238,9 +267,17 @@ def save_results(df: pd.DataFrame, path: Path = SCALED_PRICES_FILE) -> Path:
     return path
 
 
-def run(usd_amount: float, config: PricingConfig, cost_of_living_path: Path = COST_OF_LIVING_FILE) -> pd.DataFrame:
+def run(
+    usd_amount: float,
+    config: PricingConfig,
+    cost_of_living_path: Path = COST_OF_LIVING_FILE,
+    plan: "str | None" = None,
+) -> pd.DataFrame:
     """Full pipeline: load cached cost-of-living data, fetch rates, scale, and return the
     result DataFrame (caller decides whether/where to save it)."""
     df = load_cost_of_living(cost_of_living_path)
     factors = calculate_scaling_factors(df, config)
-    return scale_price(usd_amount, factors, config)
+    unknown = unknown_market_ratio_countries(config, plan, factors.keys())
+    if unknown:
+        print(f"Ignoring market ratios for countries not in the cost-of-living data: {', '.join(unknown)}")
+    return scale_price(usd_amount, factors, config, plan)

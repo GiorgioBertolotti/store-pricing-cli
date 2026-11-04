@@ -60,6 +60,7 @@ def price_preview_table(df: pd.DataFrame, limit: int = 25) -> Table:
     table.add_column("≈ USD", justify="right")
     table.add_column("VAT", justify="right")
     table.add_column("Factor", justify="right")
+    table.add_column("Basis")
 
     for _, row in df.head(limit).iterrows():
         table.add_row(
@@ -68,6 +69,7 @@ def price_preview_table(df: pd.DataFrame, limit: int = 25) -> Table:
             f"${row['Smart_Price_USD']:.2f}",
             f"{row['Tax_Rate'] * 100:.0f}%",
             f"{row['Scaling_Factor']:.2f}",
+            row.get("Pricing_Basis", "ppp"),
         )
     if len(df) > limit:
         table.caption = f"... and {len(df) - limit} more (see price_scaled.xlsx for the full list)"

@@ -18,6 +18,14 @@ rounding = "psychological"
 # Per-country overrides of the built-in VAT/GST table, e.g.:
 # Germany = 0.19
 
+# Market price ratios per plan (`--plan weekly|monthly|annual`): what users in a country
+# actually pay for that plan length, tax included, relative to the anchor country's price.
+# A country listed here skips PPP scaling and VAT is not added on top (the ratio already
+# includes it); everyone else falls back to PPP. Names are World Bank country names. E.g.:
+# [pricing.market_ratio.annual]
+# Italy = 1.05
+# Japan = 0.95
+
 [apple]
 # get_closest_price_point() skips a territory if the nearest available price point
 # differs from the target by more than this fraction of the target price...

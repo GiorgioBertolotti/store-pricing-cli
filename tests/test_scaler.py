@@ -112,3 +112,74 @@ def test_vat_rate_default_for_unknown_country():
 def test_vat_rate_override_wins_over_builtin_table():
     config = PricingConfig(vat_overrides={"Germany": 0.05})
     assert config.vat_rate("Germany") == pytest.approx(0.05)
+
+
+# --- market ratios ---
+
+def _factor(exchange_rate: float, scaling_factor: float, currency: str) -> dict:
+    return {
+        "scaling_factor": scaling_factor,
+        "meal_price_native": 1.0,
+        "meal_price_usd": 1.0,
+        "exchange_rate": exchange_rate,
+        "purchasing_power_ratio": 1.0 / scaling_factor,
+        "currency_code": currency,
+    }
+
+
+def test_market_ratio_prices_off_the_anchors_gross_price_without_adding_vat_again():
+    from store_pricing.scaler import scale_price
+
+    config = PricingConfig(rounding="none", market_ratios={"annual": {"Italy": 1.10}})
+    factors = {"United States": _factor(1.0, 1.0, "USD"), "Italy": _factor(0.9, 0.7, "EUR")}
+
+    df = scale_price(20.0, factors, config, plan="annual").set_index("Country")
+
+    assert df.loc["Italy", "Smart_Price_Native"] == pytest.approx(20.0 * 1.10 * 0.9)
+    assert df.loc["Italy", "Pricing_Basis"] == "market"
+    assert df.loc["Italy", "Scaled_Price_Native"] == pytest.approx(20.0 * 1.10 * 0.9 / 1.22)
+    assert df.loc["United States", "Pricing_Basis"] == "ppp"
+
+
+def test_without_a_plan_market_ratios_are_ignored_and_ppp_applies():
+    from store_pricing.scaler import scale_price
+
+    config = PricingConfig(rounding="none", market_ratios={"annual": {"Italy": 1.10}})
+    factors = {"Italy": _factor(0.9, 0.7, "EUR")}
+
+    df = scale_price(20.0, factors, config).set_index("Country")
+
+    assert df.loc["Italy", "Smart_Price_Native"] == pytest.approx(20.0 * 0.7 * 0.9 * 1.22)
+    assert df.loc["Italy", "Pricing_Basis"] == "ppp"
+
+
+def test_a_country_missing_from_the_plans_ratios_falls_back_to_ppp():
+    from store_pricing.scaler import scale_price
+
+    config = PricingConfig(rounding="none", market_ratios={"monthly": {"Italy": 0.85}})
+    factors = {"Italy": _factor(0.9, 0.7, "EUR")}
+
+    df = scale_price(20.0, factors, config, plan="annual").set_index("Country")
+
+    assert df.loc["Italy", "Pricing_Basis"] == "ppp"
+
+
+def test_unknown_market_ratio_countries_are_reported():
+    from store_pricing.scaler import unknown_market_ratio_countries
+
+    config = PricingConfig(market_ratios={"annual": {"Turkey": 0.8, "Italy": 1.05}})
+
+    assert unknown_market_ratio_countries(config, "annual", {"Italy", "Turkiye"}) == ["Turkey"]
+    assert unknown_market_ratio_countries(config, None, {"Italy"}) == []
+
+
+def test_vat_table_uses_world_bank_country_names():
+    import json
+    from pathlib import Path
+
+    from store_pricing.config import DEFAULT_VAT_RATES
+
+    known = set(json.loads(Path("country_codes.json").read_text()))
+    # Present in the VAT table but absent from the World Bank PPP dataset entirely.
+    no_ppp_data = {"Argentina", "Liechtenstein", "Taiwan"}
+    assert sorted(set(DEFAULT_VAT_RATES) - known - no_ppp_data) == []

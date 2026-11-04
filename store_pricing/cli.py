@@ -18,7 +18,7 @@ from store_pricing import offers as offers_mod
 from store_pricing import scaler
 from store_pricing import stripe_platform as stripe_api
 from store_pricing import wizard
-from store_pricing.config import Settings, ensure_toml_exists, load_settings
+from store_pricing.config import PLANS, Settings, ensure_toml_exists, load_settings
 from store_pricing.inputs import load_input_data
 from store_pricing.report import write_failure_report
 from store_pricing.ui import checkbox, confirm, console, diff_table, failure_summary_table, price_preview_table, price_summary, select, text
@@ -78,6 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_scale = sub.add_parser("scale", help="Compute prices -> price_scaled.xlsx (never touches a store)")
     p_scale.add_argument("--price", type=float, help="Base USD price; prompted if omitted")
     p_scale.add_argument("--out", default="price_scaled.xlsx")
+    p_scale.add_argument(
+        "--plan", choices=PLANS,
+        help="Plan length, selects [pricing.market_ratio.<plan>]; prompted if omitted and market ratios are configured",
+    )
 
     p_apply = sub.add_parser("apply", help="Push price_scaled.xlsx live to the configured store(s)")
     p_apply.add_argument("--apple", action="store_true", help="Apply to Apple (subscription) only")
@@ -336,6 +340,19 @@ def _apply_flow(settings: Settings, platforms: set[str], dry_run: bool = False, 
     return _report(failures, dry_run=dry_run)
 
 
+PPP_ONLY_CHOICE = "None of these (PPP only)"
+
+
+def _ask_plan(settings: Settings, given: "str | None") -> "str | None":
+    """The plan whose market ratios to use: the flag if given, a prompt if any ratios are
+    configured, otherwise None so pricing stays PPP-only without asking anything."""
+    if given is not None or not settings.pricing.market_ratios:
+        return given
+    configured = [plan for plan in PLANS if plan in settings.pricing.market_ratios]
+    choice = select("Which plan is this price for? (selects its market ratios)", [*configured, PPP_ONLY_CHOICE])
+    return None if choice == PPP_ONLY_CHOICE else choice
+
+
 def guided_flow() -> int:
     settings = load_settings()
     ensure_data_fresh(settings)
@@ -352,8 +369,9 @@ def guided_flow() -> int:
         console.print(f"Using credentials for: {', '.join(configured)} (`pricing.py doctor` to re-check, `pricing.py setup` to add more)")
 
     price = float(text("Base price in USD (what you charge in the US):", default="9.99", validate=_validate_price))
+    plan = _ask_plan(settings, None)
 
-    df = scaler.run(price, settings.pricing)
+    df = scaler.run(price, settings.pricing, plan=plan)
     path = scaler.save_results(df)
     console.print(price_preview_table(df))
     console.print(price_summary(df))
@@ -384,7 +402,8 @@ def cmd_scale(args) -> int:
     ensure_data_fresh(settings)
 
     price = args.price if args.price is not None else float(text("Base price in USD:", default="9.99", validate=_validate_price))
-    df = scaler.run(price, settings.pricing)
+    plan = _ask_plan(settings, args.plan)
+    df = scaler.run(price, settings.pricing, plan=plan)
     path = scaler.save_results(df, Path(args.out))
 
     console.print(price_preview_table(df))
