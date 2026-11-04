@@ -183,6 +183,7 @@ final_price    = smart_round(scaled_native)   # → .99 endings
 ```
 
 - Countries with a higher cost of living than the anchor country (default: United States) receive the full USD price (factor capped at 1.0, configurable in `pricing.toml`)
+- `min_scaling_factor` sets a floor (e.g. `0.25` = never below 25% of the anchor price), which also guards against bad PPP data points
 - VAT/GST rates are embedded for ~50 countries; unlisted countries default to 15% (both overridable)
 - Smart rounding snaps prices to platform-native tiers (e.g. `$9.99`, `$4.99`)
 

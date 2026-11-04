@@ -212,3 +212,16 @@ def test_plan_rounding_overrides_the_default_only_for_that_plan():
     assert monthly.loc["United States", "Smart_Price_Native"] == pytest.approx(2.49)
     assert monthly.loc["United States", "Rounding"] == "psychological-half"
     assert annual.loc["United States", "Smart_Price_Native"] == pytest.approx(1.99)
+
+
+def test_min_scaling_factor_floors_cheap_countries_and_leaves_others(monkeypatch):
+    monkeypatch.setattr(
+        "store_pricing.scaler.fetch_exchange_rates",
+        lambda currencies: {"USD": 1.0, "CHF": 0.9, "INR": 83.0},
+    )
+    plain = calculate_scaling_factors(_cost_of_living_df(), PricingConfig())
+    floored = calculate_scaling_factors(_cost_of_living_df(), PricingConfig(min_scaling_factor=0.9))
+
+    assert plain["India"]["scaling_factor"] < 0.9
+    assert floored["India"]["scaling_factor"] == pytest.approx(0.9)
+    assert floored["United States"]["scaling_factor"] == pytest.approx(1.0)

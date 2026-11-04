@@ -9,6 +9,9 @@
 anchor_country = "United States"
 # Scaling factor cap: countries pricier than the anchor pay full price, never a premium.
 scaling_cap = 1.0
+# Scaling factor floor: no country is discounted below this share of the anchor's price.
+# Guards against PPP data errors (e.g. a factor reported in a different currency). 0 = off.
+min_scaling_factor = 0.0
 # VAT/GST rate applied to countries not listed in [pricing.vat] below.
 default_vat = 0.15
 # "psychological" (round to .99-style endings), "psychological-half" (.49 or .99) or

@@ -134,7 +134,7 @@ def calculate_scaling_factors(df: pd.DataFrame, config: PricingConfig) -> dict[s
 
         meal_price_usd = meal_price_native / exchange_rate
         purchasing_power_ratio = max(anchor_meal_usd / meal_price_usd, 1.0)
-        scaling_factor = min(1.0 / purchasing_power_ratio, config.scaling_cap)
+        scaling_factor = max(min(1.0 / purchasing_power_ratio, config.scaling_cap), config.min_scaling_factor)
 
         factors[country] = {
             "scaling_factor": scaling_factor,

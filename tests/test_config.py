@@ -327,3 +327,16 @@ def test_market_ratio_cap_defaults_to_none(tmp_path):
     toml = tmp_path / "pricing.toml"
     toml.write_text('[pricing.market_ratio.monthly]\nNetherlands = 1.62\n')
     assert load_pricing_config(toml).market_ratio("monthly", "Netherlands") == 1.62
+
+
+def test_min_scaling_factor_above_the_cap_is_rejected(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text("[pricing]\nscaling_cap = 0.5\nmin_scaling_factor = 0.6\n")
+    with pytest.raises(ConfigError, match="min_scaling_factor"):
+        load_pricing_config(toml)
+
+
+def test_min_scaling_factor_is_parsed(tmp_path):
+    toml = tmp_path / "pricing.toml"
+    toml.write_text("[pricing]\nmin_scaling_factor = 0.25\n")
+    assert load_pricing_config(toml).min_scaling_factor == 0.25

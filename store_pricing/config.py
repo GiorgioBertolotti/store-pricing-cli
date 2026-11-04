@@ -70,6 +70,9 @@ TOML_TEMPLATE = '''\
 anchor_country = "United States"
 # Scaling factor cap: countries pricier than the anchor pay full price, never a premium.
 scaling_cap = 1.0
+# Scaling factor floor: no country is discounted below this share of the anchor's price.
+# Guards against PPP data errors (e.g. a factor reported in a different currency). 0 = off.
+min_scaling_factor = 0.0
 # VAT/GST rate applied to countries not listed in [pricing.vat] below.
 default_vat = 0.15
 # "psychological" (round to .99-style endings), "psychological-half" (.49 or .99) or
@@ -176,6 +179,7 @@ class StripeOneTimeCreds:
 class PricingConfig:
     anchor_country: str = "United States"
     scaling_cap: float = 1.0
+    min_scaling_factor: float = 0.0
     default_vat: float = 0.15
     rounding: str = "psychological"
     vat_overrides: dict = field(default_factory=dict)
@@ -472,6 +476,10 @@ def load_pricing_config(toml_path: Path = TOML_PATH) -> PricingConfig:
             for country, ratio in ratios.items()
         }
 
+    min_scaling_factor = _number(pricing, "min_scaling_factor", 0.0, "pricing", minimum=0.0)
+    if min_scaling_factor > _number(pricing, "scaling_cap", 1.0, "pricing", minimum=1e-9):
+        raise ConfigError("pricing.toml: [pricing] min_scaling_factor must not exceed scaling_cap")
+
     plan_rounding = {}
     for plan, mode in pricing.get("plan_rounding", {}).items():
         if plan not in PLANS:
@@ -488,6 +496,7 @@ def load_pricing_config(toml_path: Path = TOML_PATH) -> PricingConfig:
         # A cap below 1.0 discounts everyone including the anchor; above 1.0 lets pricier
         # countries pay a premium. Both are legitimate, so only non-positive is rejected.
         scaling_cap=_number(pricing, "scaling_cap", 1.0, "pricing", minimum=1e-9),
+        min_scaling_factor=min_scaling_factor,
         default_vat=_number(pricing, "default_vat", 0.15, "pricing", minimum=0.0),
         rounding=rounding,
         vat_overrides=vat_overrides,
