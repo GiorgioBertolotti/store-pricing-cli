@@ -4,7 +4,10 @@ Unlike Apple/Google, a Stripe Price has no per-country pricing - only per-curren
 `currency_options` on a single Price object. The Price's own default currency/unit_amount
 is immutable once created (Stripe Prices in general are immutable); `currency_options` is
 the one field on an existing Price the API still lets you patch, so that's what this
-module writes to. This mechanism works identically whether the Price is recurring
+module writes to - but only to add currencies: Stripe rejects a new unit_amount for a
+currency the Price already has ("You are attempting to update an immutable field for an
+existing currency in currency_options"), so changing an existing currency's amount needs a
+new Price too. This mechanism works identically whether the Price is recurring
 (subscription) or `type=one_time` (one-time purchase) - Stripe doesn't distinguish between
 the two for currency_options at all, so update_prices()/update_onetime_prices() and
 fetch_live_prices()/fetch_live_onetime_prices() share one implementation
@@ -39,6 +42,7 @@ import stripe
 from store_pricing.config import PricingConfig, StripeCreds, StripeOneTimeCreds
 from store_pricing.inputs import InputData
 from store_pricing.report import make_failure
+from store_pricing.scaler import apply_smart_pricing
 
 # Currencies Stripe bills in whole units instead of the usual /100 minor unit.
 # https://docs.stripe.com/currencies#zero-decimal
@@ -128,12 +132,13 @@ def group_by_currency(data: InputData) -> dict[str, list[str]]:
     return groups
 
 
-def _resolve_group_price(countries: list[str], data: InputData, anchor_country: str) -> float:
+def _resolve_group_price(countries: list[str], data: InputData, anchor_country: str, rounding: str) -> float:
     if len(countries) == 1:
         return data.country_prices[countries[0]]
     if anchor_country in countries:
         return data.country_prices[anchor_country]
-    return mean(data.country_prices[c] for c in countries)
+    # The mean of rounded prices isn't itself a price point (e.g. EUR 16.67), so round it again.
+    return apply_smart_pricing(mean(data.country_prices[c] for c in countries), rounding)
 
 
 def resolve_currency_options(
@@ -164,7 +169,7 @@ def resolve_currency_options(
                 locked[country] = reason
             continue
 
-        price = _resolve_group_price(countries, data, pricing.anchor_country)
+        price = _resolve_group_price(countries, data, pricing.anchor_country, data.rounding or pricing.rounding)
         currency_options[currency.lower()] = {"unit_amount": to_smallest_unit(price, currency)}
 
     return currency_options, locked

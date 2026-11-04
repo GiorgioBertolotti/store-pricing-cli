@@ -432,3 +432,15 @@ def test_create_stripe_offer_dry_run_sends_no_request(monkeypatch):
     assert failures == []
     assert coupons.create_calls == []
     assert promotion_codes.create_calls == []
+
+
+def test_a_shared_currency_average_is_rounded_to_a_price_point():
+    data = _data(
+        {"Italy": 18.99, "Germany": 16.99, "Greece": 13.99},
+        {"Italy": "EUR", "Germany": "EUR", "Greece": "EUR"},
+    )
+    config = PricingConfig(anchor_country="United States")
+
+    options, _ = resolve_currency_options(data, config, base_currency="USD")
+
+    assert options["eur"]["unit_amount"] == to_smallest_unit(16.99, "EUR")
