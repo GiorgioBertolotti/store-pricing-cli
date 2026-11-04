@@ -24,12 +24,24 @@ def _subscription_update():
 def test_currency_mismatch_is_fixed_in_place():
     update = _subscription_update()
     error = "region code TR is invalid: Expected TRY but got USD"
-    handled = _handle_400_error(update, error, attempt=0, extra_failures=[], auto_fixed_regions=(fixed := set()), clamped_pairs=set())
+    handled = _handle_400_error(
+        update, error, attempt=0, extra_failures=[], auto_fixed_regions=(fixed := set()), clamped_pairs=set(),
+        usd_rates={"USD": 1.0, "TRY": 40.0},
+    )
 
     assert handled is True
     assert "TR" in fixed
     tr_config = update["basePlans"][0]["regionalConfigs"][0]
     assert tr_config["price"]["currencyCode"] == "TRY"
+    # The amount is converted, not just relabelled: USD 5 -> TRY 200.
+    assert (int(tr_config["price"]["units"]), int(tr_config["price"]["nanos"])) == (200, 0)
+
+
+def test_currency_mismatch_without_exchange_rates_fails_instead_of_relabelling():
+    update = _subscription_update()
+    error = "region code TR is invalid: Expected TRY but got USD"
+    with pytest.raises(RuntimeError, match="exchange rate"):
+        _handle_400_error(update, error, attempt=0, extra_failures=[], auto_fixed_regions=set(), clamped_pairs=set())
 
 
 def test_not_billable_region_is_dropped():

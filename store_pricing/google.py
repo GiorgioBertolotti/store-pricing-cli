@@ -51,6 +51,42 @@ _CURRENCY_MISMATCH_RE = re.compile(r"region code (\w+).*?Expected (\w+) but got 
 _NOT_BILLABLE_RE = re.compile(r"Region code (\w+) is not billable")
 _PRICE_OUT_OF_RANGE_RE = re.compile(r"([\w-]+): Price for (\w+) must be between [^\d]*([\d.]+)")
 _REGION_REMOVAL_REJECTED_RE = re.compile(r"([\w-]+): Regional configs were removed from the base plan: (\w+)")
+_INVALID_REGIONS_VERSION_RE = re.compile(r"Invalid regions version \S+, latest value is \w+\{versionId=([\d/]+)\}")
+
+# Neither resource reports the regions version it was saved with, and an outdated one makes
+# Google validate against an old currency map (e.g. Bulgaria in BGN after its switch to EUR),
+# rejecting prices the Play Console itself stored. An invalid value is answered with the
+# latest one, which the patch loops pick up automatically when this goes stale.
+LATEST_REGIONS_VERSION = "2026/01"
+
+
+def _fetch_rates_or_empty() -> dict:
+    try:
+        return fetch_all_usd_rates()
+    except Exception as e:
+        print(f"Warning: could not fetch exchange rates ({e}) - a currency mismatch can't be converted")
+        return {}
+
+
+def _latest_regions_version(error_str: str) -> "str | None":
+    match = _INVALID_REGIONS_VERSION_RE.search(error_str)
+    return match.group(1) if match else None
+
+
+def _convert_price(price: dict, expected_currency: str, usd_rates: "dict | None") -> None:
+    """Re-express `price` in `expected_currency` at the current exchange rate. Relabelling the
+    currency code alone would keep the old amount (ARS 1480 becoming USD 1480)."""
+    got_currency = price.get("currencyCode")
+    rates = usd_rates or {}
+    if got_currency not in rates or expected_currency not in rates:
+        raise RuntimeError(
+            f"Google expects {expected_currency} instead of {got_currency} but no exchange rate is available "
+            "to convert the existing price - fix it in Play Console or retry when rates can be fetched"
+        )
+    amount = float(price.get("units", 0) or 0) + (price.get("nanos", 0) or 0) / 1e9
+    converted = round(amount / rates[got_currency] * rates[expected_currency], 2)
+    units, nanos = _price_to_units_nanos(converted)
+    price.update({"currencyCode": expected_currency, "units": units, "nanos": nanos})
 
 
 def _price_to_units_nanos(price: float) -> tuple:
@@ -106,9 +142,9 @@ def fetch_subscription(service, creds: GoogleCreds) -> "tuple | None":
             .get(packageName=creds.package_name, productId=creds.subscription_id)
             .execute()
         )
-        regions_version = response.get("regionsVersion", "2025/01")
-        if regions_version == "1":
-            regions_version = "2025/01"
+        regions_version = response.get("regionsVersion")
+        if not regions_version or regions_version == "1":
+            regions_version = LATEST_REGIONS_VERSION
         return response, regions_version
     except Exception as e:
         print(f"Error getting subscription details: {e}")
@@ -218,12 +254,12 @@ def _update_region(
     )
 
 
-def _fix_currency_mismatch(subscription_update, region_code, expected_currency, got_currency) -> None:
+def _fix_currency_mismatch(subscription_update, region_code, expected_currency, got_currency, usd_rates=None) -> None:
     for bp in subscription_update.get("basePlans", []):
         for config in bp.get("regionalConfigs", []):
             if config.get("regionCode") == region_code:
                 if config.get("price", {}).get("currencyCode") == got_currency:
-                    config["price"]["currencyCode"] = expected_currency
+                    _convert_price(config["price"], expected_currency, usd_rates)
 
 
 def _fix_not_billable(subscription_update, region_code) -> None:
@@ -256,13 +292,15 @@ def _fix_price_out_of_range(subscription_update, base_plan_id, region_code, min_
     return min_price, failure
 
 
-def _handle_400_error(subscription_update, error_str, attempt, extra_failures, auto_fixed_regions, clamped_pairs) -> bool:
+def _handle_400_error(
+    subscription_update, error_str, attempt, extra_failures, auto_fixed_regions, clamped_pairs, usd_rates=None,
+) -> bool:
     """Handle a recoverable Play Console 400 error. Returns True if handled, False to re-raise."""
     currency_match = _CURRENCY_MISMATCH_RE.search(error_str)
     if currency_match:
         region_code, expected_currency, got_currency = currency_match.groups()
         print(f"   Auto-fixing stale currency for {region_code}: {got_currency} → {expected_currency} (attempt {attempt + 1})")
-        _fix_currency_mismatch(subscription_update, region_code, expected_currency, got_currency)
+        _fix_currency_mismatch(subscription_update, region_code, expected_currency, got_currency, usd_rates)
         auto_fixed_regions.add(region_code)
         return True
 
@@ -322,6 +360,7 @@ def patch_with_currency_fixes(service, creds: GoogleCreds, subscription_update, 
     auto_fixed_regions = set()
     extra_failures = []
     clamped_pairs = set()
+    usd_rates = None
 
     for attempt in range(max_retries):
         request = (
@@ -344,7 +383,16 @@ def patch_with_currency_fixes(service, creds: GoogleCreds, subscription_update, 
         except HttpError as e:
             if e.resp.status != 400:
                 raise
-            if not _handle_400_error(subscription_update, str(e), attempt, extra_failures, auto_fixed_regions, clamped_pairs):
+            latest = _latest_regions_version(str(e))
+            if latest and latest != regions_version:
+                print(f"   Regions version {regions_version} is outdated, retrying with {latest} (attempt {attempt + 1})")
+                regions_version = latest
+                continue
+            if usd_rates is None and _CURRENCY_MISMATCH_RE.search(str(e)):
+                usd_rates = _fetch_rates_or_empty()
+            if not _handle_400_error(
+                subscription_update, str(e), attempt, extra_failures, auto_fixed_regions, clamped_pairs, usd_rates,
+            ):
                 raise
 
     raise RuntimeError(f"Could not resolve all API errors after {max_retries} retries")
@@ -462,7 +510,7 @@ def fetch_onetime_product(service, creds: GoogleOneTimeCreds) -> "tuple | None":
             .get(packageName=creds.package_name, productId=creds.product_id)
             .execute()
         )
-        regions_version = response.get("regionsVersion", {}).get("version", "2025/01")
+        regions_version = response.get("regionsVersion", {}).get("version") or LATEST_REGIONS_VERSION
         return response, regions_version
     except Exception as e:
         print(f"Error getting one-time product details: {e}")
@@ -552,12 +600,12 @@ def _update_onetime_region(
     )
 
 
-def _fix_onetime_currency_mismatch(product_update, region_code, expected_currency, got_currency) -> None:
+def _fix_onetime_currency_mismatch(product_update, region_code, expected_currency, got_currency, usd_rates=None) -> None:
     for po in product_update.get("purchaseOptions", []):
         for config in po.get("regionalPricingAndAvailabilityConfigs", []):
             if config.get("regionCode") == region_code:
                 if config.get("price", {}).get("currencyCode") == got_currency:
-                    config["price"]["currencyCode"] = expected_currency
+                    _convert_price(config["price"], expected_currency, usd_rates)
 
 
 def _fix_onetime_not_billable(product_update, region_code) -> None:
@@ -594,14 +642,16 @@ def _fix_onetime_price_out_of_range(product_update, purchase_option_id, region_c
     return min_price, failure
 
 
-def _handle_onetime_400_error(product_update, error_str, attempt, extra_failures, auto_fixed_regions, clamped_pairs) -> bool:
+def _handle_onetime_400_error(
+    product_update, error_str, attempt, extra_failures, auto_fixed_regions, clamped_pairs, usd_rates=None,
+) -> bool:
     """One-time-product analogue of _handle_400_error() - see that function and the module
     docstring for which regexes are shared verbatim vs product-specific."""
     currency_match = _CURRENCY_MISMATCH_RE.search(error_str)
     if currency_match:
         region_code, expected_currency, got_currency = currency_match.groups()
         print(f"   Auto-fixing stale currency for {region_code}: {got_currency} → {expected_currency} (attempt {attempt + 1})")
-        _fix_onetime_currency_mismatch(product_update, region_code, expected_currency, got_currency)
+        _fix_onetime_currency_mismatch(product_update, region_code, expected_currency, got_currency, usd_rates)
         auto_fixed_regions.add(region_code)
         return True
 
@@ -657,6 +707,7 @@ def patch_onetime_with_currency_fixes(service, creds: GoogleOneTimeCreds, produc
     auto_fixed_regions = set()
     extra_failures = []
     clamped_pairs = set()
+    usd_rates = None
 
     for attempt in range(max_retries):
         request = (
@@ -679,7 +730,16 @@ def patch_onetime_with_currency_fixes(service, creds: GoogleOneTimeCreds, produc
         except HttpError as e:
             if e.resp.status != 400:
                 raise
-            if not _handle_onetime_400_error(product_update, str(e), attempt, extra_failures, auto_fixed_regions, clamped_pairs):
+            latest = _latest_regions_version(str(e))
+            if latest and latest != regions_version:
+                print(f"   Regions version {regions_version} is outdated, retrying with {latest} (attempt {attempt + 1})")
+                regions_version = latest
+                continue
+            if usd_rates is None and _CURRENCY_MISMATCH_RE.search(str(e)):
+                usd_rates = _fetch_rates_or_empty()
+            if not _handle_onetime_400_error(
+                product_update, str(e), attempt, extra_failures, auto_fixed_regions, clamped_pairs, usd_rates,
+            ):
                 raise
 
     raise RuntimeError(f"Could not resolve all API errors after {max_retries} retries")
@@ -771,6 +831,16 @@ def backup_live(creds: "GoogleCreds | GoogleOneTimeCreds"):
 
 
 def _patch_resource(service, shape, creds, body: dict, regions_version: str) -> None:
+    try:
+        _send_patch(service, shape, creds, body, regions_version)
+    except HttpError as e:
+        latest = _latest_regions_version(str(e)) if e.resp.status == 400 else None
+        if not latest or latest == regions_version:
+            raise
+        _send_patch(service, shape, creds, body, latest)
+
+
+def _send_patch(service, shape, creds, body: dict, regions_version: str) -> None:
     if shape is backup.SUBSCRIPTION:
         request = service.monetization().subscriptions().patch(
             packageName=creds.package_name, productId=creds.subscription_id,

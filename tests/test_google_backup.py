@@ -261,3 +261,39 @@ def test_backup_live_snapshots_without_patching(monkeypatch, in_tmp):
 
     assert backup.load_backup(path)["resource"] == _subscription()
     assert service.patches == []
+
+
+# --- regions version ---
+
+def test_fetch_defaults_to_the_latest_regions_version_when_google_omits_it():
+    service = FakeService(_subscription())
+    _, version = google.fetch_subscription(service, _creds())
+    assert version == google.LATEST_REGIONS_VERSION
+
+
+def test_an_outdated_regions_version_is_replaced_by_the_one_google_names(monkeypatch, in_tmp):
+    from googleapiclient.errors import HttpError
+
+    class _Resp(dict):
+        status = 400
+        reason = "Bad Request"
+
+    sent_versions = []
+    original_execute = _Request.execute
+
+    def execute(self):
+        if self.action == "patch":
+            version = self.uri.split("regionsVersion.version=")[-1]
+            sent_versions.append(version)
+            if version != "2099/01":
+                raise HttpError(_Resp(), b'"Invalid regions version x, latest value is ExternalRegionLaunchVersionId{versionId=2099/01}"')
+        return original_execute(self)
+
+    monkeypatch.setattr(_Request, "execute", execute)
+    service = FakeService(_subscription())
+    _use(monkeypatch, service)
+
+    google.update_prices(_creds(), PricingConfig(), _data())
+
+    assert sent_versions == [google.LATEST_REGIONS_VERSION, "2099/01"]
+    assert len(service.patches) == 1
